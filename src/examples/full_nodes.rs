@@ -1,39 +1,39 @@
-// etp-core/examples/full_node.rs
+// etp-core/src/examples/full_nodes.rs
 
 use std::sync::Arc;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::time::Duration;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
 use tokio::net::TcpStream;
-use clap::{Parser, Subcommand};
-use log::{info, error, warn, debug};
+use clap::Parser;
+use log::{info, error, warn, debug, trace};
 use env_logger::Env;
 use serde::{Serialize, Deserialize};
 use dashmap::DashMap;
 use anyhow::{Result, anyhow, Context};
 
 // --- ETP Core Imports ---
-use etp_core::network::node::{EtpEngine, NodeConfig, EtpHandle};
+use etp_core::network::node::{EtpEngine, NodeConfig, EtpHandle, Command};
 use etp_core::crypto::noise::KeyPair;
 use etp_core::transport::shaper::SecurityProfile;
-use etp_core::plugin::{PluginRegistry, CapabilityProvider};
-use etp_core::network::socks5::{Socks5Server, RuleBasedRouter, AppSignal}; // AppSignal: (Target, StreamID, Data, Fin)
+use etp_core::plugin::{PluginRegistry, CapabilityProvider, Dialect, Flavor};
+use etp_core::network::socks5::{Socks5Server, RuleBasedRouter, AppSignal}; 
 
 // --- Flavors ---
 use etp_core::plugin::flavors::vpn::{VpnFlavor, VpnConfig};
 use etp_core::plugin::flavors::chat::{ChatFlavor, DhtStoreRequest};
-use etp_core::plugin::flavors::forum::ForumFlavor;
 use etp_core::plugin::flavors::tns::TnsFlavor;
 use etp_core::plugin::flavors::fileshare::FileShareFlavor;
 use etp_core::plugin::flavors::http_gateway::HttpGatewayFlavor;
 
-// --- Dialects ---
-use etp_core::wire::packet::{FakeTlsObfuscator, FakeHttpObfuscator, EntropyObfuscator, Dialect};
+// --- Dialects (Real Implementations) ---
+use etp_core::plugin::{StandardDialect, FakeTlsDialect, FakeHttpDialect, FakeQuicDialect, FakeDtlsDialect};
 
 // --- CLI Arguments ---
 #[derive(Parser)]
@@ -60,11 +60,11 @@ struct Cli {
     #[arg(long, default_value = "Balanced")]
     profile: String,
 
-    /// 首选方言 (tls, http, noise)
+    /// 首选方言 (tls, http, quic, dtls, noise)
     #[arg(long, default_value = "tls")]
     dialect: String,
 
-    /// 引导节点列表
+    /// 引导节点列表 (IP:Port)
     #[arg(long)]
     bootstrap: Vec<String>,
 }
@@ -79,11 +79,15 @@ struct IdentityFile {
 }
 
 // --- 多路复用协议 (User-Space Mux) ---
-// 由于 node.rs 在 MVP 阶段将 StreamID 固定，我们在应用层再次封装以支持 SOCKS5 并发
-// 格式: [SubStreamID(4)][OpCode(1)][Payload...]
+// Header: [StreamID(4)][OpCode(1)]
 const MUX_OP_DATA: u8 = 0x00;
-const MUX_OP_FIN: u8 = 0x01;
-const MUX_OP_OPEN: u8 = 0x02; // 携带目标地址元数据
+const MUX_OP_FIN:  u8 = 0x01;
+const MUX_OP_RST:  u8 = 0x02; // 新增 RST，用于强制断开
+
+// --- 全局统计 ---
+static TOTAL_BYTES_TX: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_BYTES_RX: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_TUNNELS: AtomicUsize = AtomicUsize::new(0);
 
 // --- 主程序 ---
 
@@ -93,21 +97,18 @@ async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
     let cli = Cli::parse();
     
-    // 确保数据目录存在
     fs::create_dir_all(&cli.data_dir).context("Failed to create data directory")?;
 
-    info!(">>> ETP System Initializing <<<");
-    info!("Storage: {:?}", cli.data_dir);
+    println!("\n========================================================");
+    println!("   ETP Node - Encrypted Transport Protocol v0.2.0");
+    println!("========================================================");
 
-    // 2. 身份管理 (生产级：加载或生成)
+    // 2. 身份管理
     let keypair = load_or_generate_identity(&cli.data_dir.join("identity.json"))?;
     let my_node_id = blake3::hash(&keypair.public).to_hex();
     
-    info!("------------------------------------------------");
-    info!("Node Identity Loaded");
-    info!("Public Key: {}", hex::encode(&keypair.public));
-    info!("Node ID:    {}", my_node_id);
-    info!("------------------------------------------------");
+    info!("Identity Loaded: {}", my_node_id);
+    info!("Listen Address: {}", cli.bind);
 
     // 3. 配置构建
     let profile = match cli.profile.as_str() {
@@ -120,42 +121,39 @@ async fn main() -> anyhow::Result<()> {
         .filter_map(|s| s.parse().ok())
         .collect();
 
-    // 确定默认方言 ID
     let default_dialect_id = match cli.dialect.as_str() {
-        "http" => "etp.dialect.quic.v1",
+        "http" => "etp.dialect.http.v1",
         "noise" => "etp.dialect.noise.std",
-        _ => "etp.dialect.dtls.v1", // Default TLS
+        "quic" => "etp.dialect.quic.v1",
+        "dtls" => "etp.dialect.dtls.v1",
+        _ => "etp.dialect.tls.v1", 
     };
 
     let config = NodeConfig {
         bind_addr: cli.bind.clone(),
-        keypair: keypair.clone(), // Clone for engine
+        keypair: keypair.clone(),
         profile,
         bootstrap_peers,
         default_dialect: default_dialect_id.to_string(),
         default_flavor: "etp.flavor.core".to_string(),
-        // 生产环境应从加密存储中加载 stateless_secret，此处演示用随机生成
         stateless_secret: rand::random(), 
     };
 
-    // 4. 插件与风味装载 (Hot-Pluggable Loader)
-    // 解决循环依赖：Flavor 需要 Sender -> Engine 需要 Registry -> Registry 需要 Flavor
-    // 方案：使用 Proxy Channel
-    let (proxy_tx, mut proxy_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(8192); // 大缓冲区
+    // 4. 插件装载 (Hot-Pluggable Loader)
+    let (proxy_tx, mut proxy_rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(8192); 
     let (dht_proxy_tx, mut dht_proxy_rx) = mpsc::channel::<DhtStoreRequest>(1024);
 
     let registry = Arc::new(PluginRegistry::new());
     let loader = PluginLoader::new(registry.clone(), &cli.data_dir, &keypair);
     
-    // 装载核心风味
     loader.load_dialects();
     loader.load_flavors(proxy_tx.clone(), dht_proxy_tx.clone())?;
 
     // 5. 启动核心引擎
-    info!("Starting ETP Kernel...");
+    info!("Bootstrapping Kernel...");
     let (engine, handle, mut app_rx) = EtpEngine::new(config.clone(), registry.clone()).await?;
     
-    // 启动 Engine 主循环 (后台)
+    // Engine Daemon
     tokio::spawn(async move {
         if let Err(e) = engine.run().await {
             error!("CRITICAL: ETP Engine crashed: {}", e);
@@ -163,110 +161,94 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 6. 启动 Proxy 桥接 (闭环)
-    // Flavor -> Engine Data
+    // 6. 启动 Proxy 桥接
+    // Flavor -> Engine (Data)
     let h_data = handle.clone();
     tokio::spawn(async move {
         while let Some((target, data)) = proxy_rx.recv().await {
             if let Err(e) = h_data.send_data(target, data).await {
-                debug!("Failed to proxy data to engine: {}", e);
+                debug!("Proxy send error: {}", e);
             }
         }
     });
 
-    // Flavor -> DHT Store
+    // Flavor -> Engine (DHT Store)
     let h_dht = handle.clone();
     tokio::spawn(async move {
         while let Some(req) = dht_proxy_rx.recv().await {
             if let Err(e) = h_dht.dht_store(req.key, req.value, req.ttl).await {
-                debug!("Failed to proxy DHT store: {}", e);
+                debug!("DHT proxy error: {}", e);
             }
         }
     });
 
-    // 7. SOCKS5 & Multiplexing Gateway (高级实现)
+    // 7. SOCKS5 Gateway (Ingress)
     // ---------------------------------------------------------
-    // 负责处理 SOCKS5 的 TCP 连接与 ETP Stream 之间的映射
-    // 支持高并发多路复用
+    // 本地 SOCKS5 端口 -> ETP 隧道
     // ---------------------------------------------------------
-    
-    // A. SOCKS5 Ingress (本地 -> 隧道)
     let socks_addr = format!("127.0.0.1:{}", cli.socks_port);
     let (s5_tx, mut s5_rx) = mpsc::channel::<AppSignal>(4096);
     
-    // 路由规则：默认发给 "0.0.0.0:0"，由 ETP 层的 handle.connect 决定实际去向
-    // 注意：全节点模式下，我们通常连接到一个 Exit Node。
-    // 这里为了演示，我们假设用户会通过 `connect` 命令手动建立到 Exit Node 的连接，
-    // SOCKS5 流量会自动复用该连接。
+    // 路由表：这里简化为总是发给“已连接的第一个节点”或者通过 CLI `connect` 指定的节点
+    // 在真实应用中，Router 会根据 Target 决定下一跳
     let router = Arc::new(RuleBasedRouter::new(vec![])); 
-    let s5_server = Socks5Server::new(socks_addr.clone(), s5_tx, "0.0.0.0:0".parse().unwrap());
+    let s5_server = Socks5Server::new(socks_addr.clone(), s5_tx, router, 1000);
 
-    // SOCKS5 Adapter Task
+    // SOCKS5 Ingress Task
+    // 负责将 SOCKS5 请求打包成 MUX 协议发送给 Engine
     let s5_handle = handle.clone();
+    // 全局默认路由目标 (可由 CLI 'connect' 更新)
+    let default_route: Arc<dashmap::DashMap<String, SocketAddr>> = Arc::new(dashmap::DashMap::new());
+    
     tokio::spawn(async move {
         while let Some((target, stream_id, data, fin)) = s5_rx.recv().await {
-            // Mux Protocol Encapsulation: [StreamID(4)][Op(1)][Data]
-            // 如果是首包 (含有 Metadata 的 OPEN 操作)，需要特殊处理吗？
-            // Socks5Server 发送的第一个包是 Metadata。
-            // 我们可以在这里简单地将所有数据都视为 DATA，依靠接收端解析。
-            // 更好的做法：使用 OpCode 区分。
-            
-            // 简单的 Mux 协议：
+            // Mux Protocol: [StreamID(4)][Op(1)][Data...]
             let op = if fin { MUX_OP_FIN } else { MUX_OP_DATA };
             
-            // 预分配缓冲区
             let mut payload = Vec::with_capacity(5 + data.len());
             payload.extend_from_slice(&stream_id.to_be_bytes());
             payload.push(op);
-            payload.extend(data); // Metadata is inside data for the first packet
+            payload.extend(data);
 
-            // 发送给目标 Exit Node
-            // 如果 Target 是 0.0.0.0，说明未指定，可能需要广播或丢弃。
-            // 在 CLI 演示中，用户必须先 connect ExitNode，然后所有 SOCKS 流量流向该 Node。
-            // 我们需要一个全局的 "Default Route"。
-            // 这里简化：发送给 handle，如果 handle 内部没有 Session 映射，会触发 On-demand connect。
-            // 但 0.0.0.0 是无法 Connect 的。
-            // 修正：我们通过全局变量或 CLI 参数获取 Default Exit Node。
-            // 暂时假设用户必须在 CLI 中 connect，并且 SOCKS5 请求中的 target 会被忽略，
-            // 实际上应该由 Router 决定。
+            // 路由逻辑：如果 SOCKS5 Server 传来的 target 是 0.0.0.0 (未指定)，
+            // 我们需要决定发给谁。这里我们广播给所有活跃会话？或者发给最近一个？
+            // 简单起见：如果 target 有效则发给 target，否则尝试查找 Default Route。
+            // 注意：full_nodes.rs 里的 socks5 server 实现是将 request 发给 Exit Node。
+            // 这里的 'target' 实际上是 Exit Node 的地址。
             
-            // 这里的 target 来自 Socks5Server 的 exit_node (0.0.0.0)。
-            // 这是一个演示限制。
-            // 生产级：SOCKS5 Router 应该配置真实的 Exit Node IP。
-            // 我们在接收到数据时，如果是 0.0.0.0，尝试使用 "最近活跃的 Peer"。
-            
-            if target.ip().is_unspecified() {
-                // Broadcast or pick first active session? 
-                // Too complex for example. We require explicit target in real app.
-                // For demo, we just try to send to "target", assuming handle logic might fix it or fail.
-            } else {
+            if !target.ip().is_unspecified() {
                 let _ = s5_handle.send_data(target, payload).await;
+                TOTAL_BYTES_TX.fetch_add(payload.len(), Ordering::Relaxed);
+            } else {
+                // Drop or log warning
+                // debug!("SOCKS5: No route for packet");
             }
         }
     });
 
-    // 启动 SOCKS5 监听 (接收来自 Router 的回包)
+    // SOCKS5 Return Path (用于接收本地 SOCKS5 Server 的回包)
     let (s5_in_tx, s5_in_rx) = mpsc::channel(4096);
+    
     tokio::spawn(async move {
         if let Err(e) = s5_server.run(s5_in_rx).await {
             error!("SOCKS5 Server Error: {}", e);
         }
     });
 
-    // B. SOCKS5 Egress (隧道 -> 本地/出口)
-    // 维护 "Exit Node" 端的连接状态
-    // 当本节点作为出口节点时，需要解析 Mux 包并发起 TCP 连接
+    // 8. Exit Node Logic (Egress) & App Data Dispatcher
+    // ---------------------------------------------------------
+    // 处理来自 ETP 隧道的包 -> 转发给本地 SOCKS5 或 发起 TCP 连接
+    // ---------------------------------------------------------
     
-    // Map: (SourcePeer, StreamID) -> TcpSender
+    // 活跃出口连接表: (SourcePeer, StreamID) -> TCP Sender
     let egress_conns = Arc::new(DashMap::new());
     
-    // C. App Data Dispatcher (Main Demultiplexer)
-    // 处理从 app_rx 接收到的数据：解包 Mux -> 分发
+    let h_egress = handle.clone();
+    
     tokio::spawn(async move {
-        let active_conns = egress_conns;
-        
         while let Some((src, data)) = app_rx.recv().await {
-            // Mux Unpack: [StreamID(4)][Op(1)][Payload]
+            TOTAL_BYTES_RX.fetch_add(data.len(), Ordering::Relaxed);
+            
             if data.len() < 5 { continue; }
             
             let stream_id = u32::from_be_bytes(data[0..4].try_into().unwrap());
@@ -275,64 +257,53 @@ async fn main() -> anyhow::Result<()> {
 
             match op {
                 MUX_OP_DATA => {
-                    // 1. 检查是否是 SOCKS5 回包 (作为 Client 收到)
-                    // 如果 SOCKS5 Server 在运行，它会处理 src 对应的流。
-                    // 但是 Socks5Server 是处理 "我请求出去" 的回包。
-                    // 这里我们分两类：
-                    // Case A: 我是 Client，收到 ExitNode 的回包 -> 转给 Socks5Server 的 s5_in_tx
-                    // Case B: 我是 ExitNode，收到 Client 的请求 -> 发起 TCP 连接
+                    // 1. 尝试作为 SOCKS5 Client 的回包处理
+                    // 如果本地 SOCKS5 Server 有对应的 stream_id (发起的请求)，s5_in_tx 会处理
+                    // 注意：这里的 stream_id 可能冲突，如果在同一节点既做 Client 又做 Server。
+                    // 理想情况下应区分 Stream ID 范围 (Client 偶数, Server 奇数)。
+                    // 这里我们尝试发送，如果 SOCKS5 Server 不认识 ID，它会忽略。
+                    // 但我们需要知道是否被处理了。
                     
-                    // 为了简化全节点逻辑，我们假设：
-                    // 如果本地有 SOCKS5 请求发出去 (Inbound Map hit)，则是 Case A。
-                    // 否则尝试 Case B。
-                    
-                    // 尝试发送给本地 SOCKS5 Server (Case A)
-                    // s5_in_tx 需要 (Src, StreamID, Data)
-                    if s5_in_tx.send((src, stream_id, payload.to_vec())).await.is_ok() {
-                        // 如果 SOCKS5 Server 识别这个 StreamID，它会处理。
-                        // 但 SOCKS5 Server 的 active_conns 是私有的。
-                        // 这里有一个架构耦合问题。
-                        // 生产级：应该用一个统一的 SessionManger。
-                        // 本例：全量转发给 SOCKS5 Inbound。如果它不认识 StreamID，它会丢弃/Log。
-                        // 同时，如果是 Case B (我是服务器)，SOCKS5 Inbound 也会丢弃。
-                        // 所以我们需要处理 Case B。
-                    }
-                    
-                    // 处理 Case B (Exit Node Logic)
-                    // 如果 SOCKS5 没处理 (即不是我发起的)，那么我是出口。
-                    // 检查 egress_conns
-                    if let Some(tx) = active_conns.get(&(src, stream_id)) {
+                    // 简单策略：先查 egress_conns (作为服务器的连接)。如果有，直接处理。
+                    if let Some(tx) = egress_conns.get(&(src, stream_id)) {
                         let _ = tx.send(payload.to_vec()).await;
                     } else {
-                        // 新的连接请求？
-                        // 第一个包通常包含 Metadata (Target Address)
-                        // 解析 Metadata
-                        if payload.len() > 1 && payload[0] == 0x01 { // CMD_CONNECT (from SOCKS5 impl)
-                             // Handle New Exit Connection
-                             handle_new_exit_connection(
-                                 src, stream_id, payload.to_vec(), 
-                                 active_conns.clone(), 
-                                 s5_handle.clone() // Need handle to send back data
-                             );
+                        // 没在 egress 表中，可能是 SOCKS5 Client 回包，发给 s5_in_tx
+                        // 或者，这是一个新的 Exit Request (Open)
+                        
+                        // 检查是否是新的连接请求 (Metadata)
+                        // 协议约定：第一个数据包如果是 Metadata (CMD_CONNECT)，则是新连接
+                        // 我们的 SOCKS5 Server 实现发出的第一个包是 [0x01][Metadata]
+                        if payload.len() > 1 && payload[0] == 0x01 {
+                            // 这是新连接请求！
+                            handle_new_exit_connection(
+                                src, stream_id, payload.to_vec(),
+                                egress_conns.clone(),
+                                h_egress.clone()
+                            ).await;
+                        } else {
+                            // 既不是已知的 Egress，也不是新请求，那就尝试发给 Ingress (作为 Client 回包)
+                            // 注意：这里有个潜在的 ID 冲突问题。但在 Demo 中暂且接受。
+                            let _ = s5_in_tx.send((src, stream_id, payload.to_vec())).await;
                         }
                     }
                 },
-                MUX_OP_FIN => {
+                MUX_OP_FIN | MUX_OP_RST => {
                     // 关闭连接
-                    if let Some((_, tx)) = active_conns.remove(&(src, stream_id)) {
-                        // Drop tx closes channel
+                    if let Some((_, tx)) = egress_conns.remove(&(src, stream_id)) {
+                        // Drop tx triggers clean shutdown
                         debug!("Closed egress stream {} from {}", stream_id, src);
                     }
-                    // 同时也发给 SOCKS5 Server 以防是 Client 端
-                    let _ = s5_in_tx.send((src, stream_id, Vec::new())).await;
+                    // 同时也通知 SOCKS5 Inbound
+                    let _ = s5_in_tx.send((src, stream_id, Vec::new())).await; // Empty data + closed channel will signal FIN
                 },
                 _ => {}
             }
         }
     });
 
-    // 8. HTTP Gateway (无感接入)
-    // 需等待 Flavors 初始化完毕
+    // 9. HTTP Gateway (无感接入)
+    // 等待 Flavors 初始化
     let tns_f = registry.get_flavor("etp.flavor.tns.v1")
         .expect("TNS Flavor missing")
         .downcast_arc::<TnsFlavor>().ok().expect("TNS Type mismatch");
@@ -343,7 +314,7 @@ async fn main() -> anyhow::Result<()> {
 
     let _http_gw = HttpGatewayFlavor::new(cli.http_port, tns_f.clone(), fs_f.clone());
 
-    // 9. 用户交互 CLI
+    // 10. 用户交互 CLI
     run_repl(my_node_id, socks_addr, cli.http_port, handle, tns_f, fs_f, registry.clone()).await?;
 
     Ok(())
@@ -354,16 +325,11 @@ fn load_or_generate_identity(path: &Path) -> Result<KeyPair> {
     if path.exists() {
         let content = fs::read_to_string(path)?;
         let id_file: IdentityFile = serde_json::from_str(&content)?;
-        
         let pub_bytes = hex::decode(&id_file.public_key_hex)?;
         let priv_bytes = hex::decode(&id_file.private_key_hex)?;
-        
-        Ok(KeyPair {
-            public: pub_bytes,
-            private: priv_bytes,
-        })
+        Ok(KeyPair { public: pub_bytes, private: priv_bytes })
     } else {
-        info!("Identity file not found. Generating new identity...");
+        info!("Generating new identity...");
         let keypair = KeyPair::generate();
         let id_file = IdentityFile {
             public_key_hex: hex::encode(&keypair.public),
@@ -371,40 +337,137 @@ fn load_or_generate_identity(path: &Path) -> Result<KeyPair> {
             node_id: blake3::hash(&keypair.public).to_hex().to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
         };
-        
         let json = serde_json::to_string_pretty(&id_file)?;
         fs::write(path, json)?;
-        info!("New identity saved to {:?}", path);
         Ok(keypair)
     }
 }
 
-// --- 辅助函数：出口节点连接处理 ---
-fn handle_new_exit_connection(
+// --- 核心：出口节点连接处理 (Full Implementation) ---
+async fn handle_new_exit_connection(
     src: SocketAddr,
     stream_id: u32,
-    meta_data: Vec<u8>,
+    metadata: Vec<u8>,
     conns: Arc<DashMap<(SocketAddr, u32), mpsc::Sender<Vec<u8>>>>,
     handle: EtpHandle
 ) {
-    tokio::spawn(async move {
-        // 解析 Metadata (假设是 SOCKS5 Metadata 格式 [0x01][ATYP][ADDR][PORT])
-        // 简单起见，我们跳过详细解析，直接尝试连接
-        // 生产级：复用 Socks5Server::read_target_addr 逻辑
-        // 这里仅作演示：假设 metadata 包含 IP:Port 字符串
-        
-        // 真实情况：我们需要反序列化 Metadata。
-        // 为了演示，我们假设 Target 是 "google.com:80"
-        warn!("ExitNode: Received CONNECT request from {}, Stream {}, but metadata parsing is simplified in demo.", src, stream_id);
-        
-        // 模拟：建立 TCP 连接
-        // let stream = TcpStream::connect(target).await...
-        // 注册到 conns
-        // 开启读写循环，读取 TCP 发送回 handle (Wrap Mux Header)
-    });
+    // 1. 解析目标地址
+    // Metadata format (from Socks5Server): [CMD(1)][ATYP(1)][ADDR...][PORT(2)]
+    // CMD is 0x01 (CONNECT) or 0x03 (UDP). We only handle CONNECT here for TCP exit.
+    
+    if metadata.len() < 4 { return; }
+    // Skip CMD (byte 0)
+    let target_res = parse_socks_target(&metadata[1..]);
+    
+    match target_res {
+        Ok(target_str) => {
+            info!("ExitNode: Connecting to {} for {} (Stream {})", target_str, src, stream_id);
+            
+            // 2. 异步发起 TCP 连接
+            // 使用 tokio::spawn 避免阻塞主分发循环
+            tokio::spawn(async move {
+                match TcpStream::connect(&target_str).await {
+                    Ok(socket) => {
+                        ACTIVE_TUNNELS.fetch_add(1, Ordering::Relaxed);
+                        let (mut ri, mut wi) = socket.into_split();
+                        
+                        // 创建通道用于从 ETP 接收数据写入 TCP
+                        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4096);
+                        conns.insert((src, stream_id), tx);
+                        
+                        // Task A: ETP -> TCP (Downlink)
+                        let t1 = tokio::spawn(async move {
+                            while let Some(data) = rx.recv().await {
+                                if data.is_empty() { break; } // FIN signal
+                                if wi.write_all(&data).await.is_err() { break; }
+                            }
+                            let _ = wi.shutdown().await;
+                        });
+                        
+                        // Task B: TCP -> ETP (Uplink)
+                        let handle_clone = handle.clone();
+                        let t2 = tokio::spawn(async move {
+                            let mut buf = [0u8; 8192];
+                            loop {
+                                match ri.read(&mut buf).await {
+                                    Ok(0) => break, // EOF
+                                    Ok(n) => {
+                                        // Wrap Mux Header: [ID][DATA][Payload]
+                                        let mut pkg = Vec::with_capacity(5 + n);
+                                        pkg.extend_from_slice(&stream_id.to_be_bytes());
+                                        pkg.push(MUX_OP_DATA);
+                                        pkg.extend_from_slice(&buf[..n]);
+                                        
+                                        if handle_clone.send_data(src, pkg).await.is_err() {
+                                            break;
+                                        }
+                                        TOTAL_BYTES_TX.fetch_add(n, Ordering::Relaxed);
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            // Send FIN
+                            let mut fin_pkg = Vec::with_capacity(5);
+                            fin_pkg.extend_from_slice(&stream_id.to_be_bytes());
+                            fin_pkg.push(MUX_OP_FIN);
+                            let _ = handle_clone.send_data(src, fin_pkg).await;
+                        });
+                        
+                        // 等待任意一方结束，清理资源
+                        let _ = tokio::join!(t1, t2);
+                        conns.remove(&(src, stream_id));
+                        ACTIVE_TUNNELS.fetch_sub(1, Ordering::Relaxed);
+                        debug!("ExitNode: Connection closed {} <-> {}", src, target_str);
+                    }
+                    Err(e) => {
+                        warn!("ExitNode: Failed to connect to {}: {}", target_str, e);
+                        // Send RST back
+                        let mut rst_pkg = Vec::with_capacity(5);
+                        rst_pkg.extend_from_slice(&stream_id.to_be_bytes());
+                        rst_pkg.push(MUX_OP_RST);
+                        let _ = handle.send_data(src, rst_pkg).await;
+                    }
+                }
+            });
+        }
+        Err(e) => {
+            warn!("ExitNode: Malformed metadata from {}: {}", src, e);
+        }
+    }
 }
 
-// --- 辅助结构：插件加载器 ---
+// 解析 SOCKS5 地址格式 (Raw Bytes -> String)
+fn parse_socks_target(buf: &[u8]) -> Result<String> {
+    if buf.is_empty() { return Err(anyhow!("Empty buffer")); }
+    let atyp = buf[0];
+    
+    match atyp {
+        0x01 => { // IPv4
+            if buf.len() < 7 { return Err(anyhow!("IPv4 too short")); }
+            let ip = Ipv4Addr::new(buf[1], buf[2], buf[3], buf[4]);
+            let port = u16::from_be_bytes([buf[5], buf[6]]);
+            Ok(format!("{}:{}", ip, port))
+        },
+        0x03 => { // Domain
+            if buf.len() < 2 { return Err(anyhow!("Domain too short")); }
+            let len = buf[1] as usize;
+            if buf.len() < 2 + len + 2 { return Err(anyhow!("Domain len mismatch")); }
+            let domain = String::from_utf8(buf[2..2+len].to_vec())?;
+            let port = u16::from_be_bytes([buf[2+len], buf[2+len+1]]);
+            Ok(format!("{}:{}", domain, port))
+        },
+        0x04 => { // IPv6
+            if buf.len() < 19 { return Err(anyhow!("IPv6 too short")); }
+            let ip_bytes: [u8; 16] = buf[1..17].try_into()?;
+            let ip = Ipv6Addr::from(ip_bytes);
+            let port = u16::from_be_bytes([buf[17], buf[18]]);
+            Ok(format!("[{}]:{}", ip, port))
+        },
+        _ => Err(anyhow!("Unknown ATYP {}", atyp)),
+    }
+}
+
+// --- 插件加载器 ---
 struct PluginLoader {
     registry: Arc<PluginRegistry>,
     data_dir: PathBuf,
@@ -417,29 +480,41 @@ impl PluginLoader {
     }
 
     fn load_dialects(&self) {
-        // 生产级：可以从 config 读取列表
-        self.registry.register_dialect(Arc::new(FakeTlsObfuscator));
-        self.registry.register_dialect(Arc::new(FakeHttpObfuscator));
-        self.registry.register_dialect(Arc::new(EntropyObfuscator));
+        self.registry.register_dialect(Arc::new(FakeTlsDialect));
+        self.registry.register_dialect(Arc::new(FakeHttpDialect));
+        self.registry.register_dialect(Arc::new(FakeQuicDialect));
+        self.registry.register_dialect(Arc::new(FakeDtlsDialect));
+        self.registry.register_dialect(Arc::new(StandardDialect));
     }
 
     fn load_flavors(&self, proxy_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>, dht_tx: mpsc::Sender<DhtStoreRequest>) -> Result<()> {
-        // 这里展示了如何根据配置“热插拔”
-        // 在实际应用中，可以在此读取 config.json 中的 enabled_flavors 列表
-        
-        // Helper to convert keys
-        let sign_key: [u8;32] = self.keypair.private.as_slice().try_into().unwrap(); // Mock
-        let enc_key: [u8;32] = self.keypair.private.as_slice().try_into().unwrap();  // Mock
+        let sign_key: [u8;32] = self.keypair.private.as_slice().try_into().unwrap();
+        let enc_key: [u8;32] = self.keypair.private.as_slice().try_into().unwrap(); // Mock reuse
 
-        // Chat
         let chat = ChatFlavor::new(
             self.data_dir.join("chat.db").to_str().unwrap(),
             &sign_key, &enc_key, dht_tx.clone(), proxy_tx.clone()
         )?;
         self.registry.register_flavor(chat);
 
-        // ... 其他 Flavor 加载逻辑同 main ...
-        
+        let tns = TnsFlavor::new(
+            self.data_dir.join("tns.db").to_str().unwrap(),
+            &sign_key, dht_tx.clone(), proxy_tx.clone()
+        )?;
+        self.registry.register_flavor(tns);
+
+        let fs = FileShareFlavor::new(
+            self.data_dir.join("files").to_str().unwrap(),
+            proxy_tx.clone()
+        )?;
+        self.registry.register_flavor(fs);
+
+        #[cfg(feature = "vpn")]
+        {
+            let vpn = VpnFlavor::new(proxy_tx.clone(), None);
+            self.registry.register_flavor(vpn);
+        }
+
         Ok(())
     }
 }
@@ -460,7 +535,7 @@ async fn run_repl(
 
     loop {
         line.clear();
-        print!("ETP@{}> ", &node_id[0..8]);
+        print!("\nETP@{}> ", &node_id[0..8]);
         use std::io::Write;
         std::io::stdout().flush()?;
 
@@ -469,13 +544,22 @@ async fn run_repl(
         if parts.is_empty() { continue; }
 
         match parts[0] {
+            "help" => {
+                println!("Commands:");
+                println!("  connect <ip:port> <hex_pubkey>  - Connect to a peer manually");
+                println!("  resolve <name>                  - Resolve TNS name");
+                println!("  share <path>                    - Share a file");
+                println!("  stats                           - Show traffic statistics");
+                println!("  info                            - Show node status");
+                println!("  quit / exit                     - Shutdown");
+            },
             "connect" => {
                 if parts.len() < 3 { println!("Usage: connect <ip:port> <hex_pubkey>"); continue; }
                 if let Ok(addr) = parts[1].parse() {
                     if let Ok(key) = hex::decode(parts[2]) {
                         info!("Connecting to {}...", addr);
                         handle.connect(addr, key).await?;
-                    } else { println!("Invalid Key"); }
+                    } else { println!("Invalid Key (Hex)"); }
                 } else { println!("Invalid Address"); }
             },
             "resolve" => {
@@ -492,50 +576,39 @@ async fn run_repl(
                     Err(e) => println!("Error: {}", e),
                 }
             },
+            "stats" => {
+                let tx = TOTAL_BYTES_TX.load(Ordering::Relaxed);
+                let rx = TOTAL_BYTES_RX.load(Ordering::Relaxed);
+                let active = ACTIVE_TUNNELS.load(Ordering::Relaxed);
+                println!("--- Traffic Statistics ---");
+                println!("TX: {:.2} MB", tx as f64 / 1024.0 / 1024.0);
+                println!("RX: {:.2} MB", rx as f64 / 1024.0 / 1024.0);
+                println!("Active Exit Tunnels: {}", active);
+            },
             "info" => {
                 println!("--- ETP Node Status ---");
                 println!("ID: {}", node_id);
                 println!("SOCKS5: {}", socks_addr);
                 println!("HTTP GW: http://127.0.0.1:{}", http_port);
-                println!("Storage: Active");
             },
             "quit" | "exit" => {
                 info!("Shutting down...");
                 break;
             },
-            _ => println!("Unknown command. Try: connect, resolve, share, info, quit"),
+            _ => println!("Unknown command. Type 'help'."),
         }
     }
     Ok(())
 }
 
-// Helper trait specifically for downcast_arc
 trait DowncastArc {
     fn downcast_arc<T: 'static>(self) -> Result<Arc<T>, Arc<dyn etp_core::plugin::Flavor>>;
 }
 
 impl DowncastArc for Arc<dyn etp_core::plugin::Flavor> {
     fn downcast_arc<T: 'static>(self) -> Result<Arc<T>, Arc<dyn etp_core::plugin::Flavor>> {
-        // 生产级实现：基于原始指针的类型转换
-        // 
-        // 原理：Arc<dyn Trait> 是一个胖指针 (Data Ptr + VTable Ptr)，而 Arc<T> 是一个瘦指针 (Data Ptr)。
-        // 这里的转换通过 Arc::into_raw 提取胖指针，再强制转换为 T 的瘦指针，最后通过 Arc::from_raw 重建 Arc。
-        //
-        // 安全性说明 (Safety):
-        // 这是一个 unsafe 操作。Rust 编译器无法在编译期验证 dyn Trait 此时背后的真实类型是否为 T。
-        // 但在 ETP 的架构中，我们通过 PluginRegistry 的 "Capability ID" (String) 进行了严格的类型映射。
-        // 只要调用者（full_node.rs）保证 get_flavor("id_of_T") 对应的是 T 类型，此操作即是安全的。
-        
         let raw: *const dyn etp_core::plugin::Flavor = Arc::into_raw(self);
-        
-        // 这里的 cast 会丢弃 vtable 信息，只保留数据指针
         let cast_ptr: *const T = raw as *const T;
-        
-        // Safety: 
-        // 1. 指针来源是 Arc::into_raw，内存布局符合 Arc 要求。
-        // 2. 类型一致性由上层 Registry 逻辑保证。
-        unsafe {
-            Ok(Arc::from_raw(cast_ptr))
-        }
+        unsafe { Ok(Arc::from_raw(cast_ptr)) }
     }
 }

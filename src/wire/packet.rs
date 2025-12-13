@@ -3,6 +3,9 @@
 use crate::{PacketNumber, SessionID};
 use crate::wire::frame::Frame;
 use crate::crypto::noise::NoiseSession;
+// 引入插件模块中的 Dialect 定义，避免重复定义
+use crate::plugin::Dialect;
+
 use serde::{Serialize, Deserialize};
 use rand::Rng;
 use anyhow::{Result, anyhow};
@@ -12,7 +15,7 @@ use sha2::Sha256;
 use chrono::Utc;
 use bytes::{Bytes, BytesMut, BufMut};
 use std::sync::Mutex;
-use lazy_static::lazy_static; // 需要在 Cargo.toml 添加 lazy_static
+use lazy_static::lazy_static; 
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -62,13 +65,7 @@ pub fn release_buffer(buf: Vec<u8>) {
     PACKET_POOL.lock().unwrap().release(buf);
 }
 
-/// 混淆器接口
-pub trait Dialect: Send + Sync + Debug {
-    fn id(&self) -> &'static str;
-    fn seal(&self, payload: &mut Vec<u8>);
-    fn open(&self, data: &[u8]) -> Result<Vec<u8>>;
-    fn probe(&self, data: &[u8]) -> bool;
-}
+// 注意：原先此处定义的 pub trait Dialect 已移除，统一使用 plugin::Dialect
 
 // --- 包结构定义 ---
 
@@ -145,29 +142,13 @@ impl TokenManager {
 
 // --- 物理包封装 (零拷贝优化) ---
 
-/// 物理层数据包
-/// 持有 Bytes，支持零拷贝切片传递给 UDP socket (如果使用了 tokio-uring 或 sendmsg)
-/// 但标准的 UdpSocket::send_to 需要 &[u8]，所以我们依然保留 Vec<u8> 或 Bytes 的形式
 pub struct RawPacket {
-    /// 这里的 data 使用 Bytes，它可以是从 Pool 中获取的 Vec 转换而来
     pub data: Bytes, 
-    /// 原始缓冲区，用于 Drop 时归还给 Pool (可选，若使用 Bytes 的 Owner 机制需小心)
-    /// 简化起见，我们在 RawPacket 销毁时不自动归还到 Pool，而是依赖调用方在加密时复用
-    /// 或者，我们只在 Encrypt 时从 Pool 拿 Vec，加密完转成 Bytes 发送，发送完 Bytes Drop 释放内存。
-    /// 标准 Bytes 是引用计数的，不直接对应我们的 Pool。
-    /// 所以为了最大化利用 Pool，RawPacket 内部应持有 `Vec<u8>` (from pool)。
-    /// 但为了 `Bytes` 接口兼容性，我们这里权衡一下：
-    /// 加密时： Acquire Vec -> Encrypt -> Dialect -> Wrap in RawPacket.
-    /// 发送后： RawPacket Drop -> Vec Drop (Dealloc).
-    /// 为了真的复用，我们需要手动释放。
-    /// 
-    /// 改进：RawPacket 持有 `Option<Vec<u8>>`。如果不空，Drop 时 release。
     pub _backing_buffer: Option<Vec<u8>>,
 }
 
 impl RawPacket {
     /// 零拷贝加密并封装
-    /// 使用分散/聚集 I/O 思想：预分配一个足够大的 Buffer (从 Pool)，然后依次写入。
     pub fn encrypt_and_seal(
         packet: &DecryptedPacket,
         crypto: &mut NoiseSession,
@@ -179,7 +160,6 @@ impl RawPacket {
         let mut buffer = acquire_buffer();
         
         // 2. 序列化 (Bincode 写入 Buffer)
-        // bincode::serialize_into 会追加数据
         match packet {
             DecryptedPacket::Stateful(p) => bincode::serialize_into(&mut buffer, p)?,
             DecryptedPacket::Stateless(p) => bincode::serialize_into(&mut buffer, p)?,
@@ -197,12 +177,8 @@ impl RawPacket {
         }
 
         // 4. Encrypt
-        // Noise 协议加密是原地或追加的。这里我们需要一个输出缓冲区。
-        // 为了避免拷贝，我们再次利用 Pool，或者如果是 In-place 加密支持的话更好。
-        // snow/noise 通常支持 write_message 到输出 buf。
-        // 为了性能，我们拿第二个 buffer 作为密文容器。
+        // 使用第二个 buffer 作为密文容器
         let mut cipher_buffer = acquire_buffer();
-        // 预留空间 (Header 等) 如果需要。Noise 追加 tag。
         cipher_buffer.resize(buffer.len() + 16 + 100, 0); // 预估容量
         
         let len = crypto.encrypt(&buffer, &mut cipher_buffer)?;
@@ -211,11 +187,11 @@ impl RawPacket {
         // 归还明文 buffer
         release_buffer(buffer);
 
-        // 5. Dialect Obfuscation (In-place if possible)
+        // 5. Dialect Obfuscation (In-place)
         dialect.seal(&mut cipher_buffer);
 
         Ok(RawPacket {
-            data: Bytes::from(cipher_buffer.clone()), // Zero-copy share if needed, but here we enforce ownership logic below
+            data: Bytes::from(cipher_buffer.clone()), 
             _backing_buffer: Some(cipher_buffer),
         })
     }
@@ -238,7 +214,6 @@ impl RawPacket {
         plaintext_buf.truncate(len);
 
         // 3. Deserialize
-        // 尝试解析
         use bincode::Options;
         let decoder = bincode::DefaultOptions::new().allow_trailing_bytes();
 
