@@ -160,6 +160,7 @@ struct ProcessingContext {
     data_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>, // App Uplink
     dht_pending_queries: Arc<DashMap<u64, oneshot::Sender<Result<Vec<NodeInfo>>>>>,
     token_manager: Arc<TokenManager>,
+    dht_store: Arc<DashMap<NodeID, (Vec<u8>, std::time::SystemTime)>>,
 }
 
 // --- 核心引擎 ---
@@ -170,6 +171,8 @@ pub struct EtpEngine {
     // 输入通道
     data_rx: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
     cmd_rx: mpsc::Receiver<Command>,
+    
+    dht_store: Arc::new(DashMap::new()),
 }
 
 impl EtpEngine {
@@ -324,7 +327,7 @@ impl EtpEngine {
             }
         }
     }
-
+    
     // --- 入站包处理流水线 (Pipeline) ---
 
     fn spawn_incoming_handler(&self, data: Vec<u8>, src: SocketAddr) {
@@ -332,115 +335,180 @@ impl EtpEngine {
 
         tokio::spawn(async move {
             // =================================================================
-            // Stage 1: 有状态处理 (Stateful Session)
+            // Stage 1: 有状态处理 (Stateful Session) - 含动态方言纠偏
             // =================================================================
             if let Some(session_lock) = ctx.sessions.get(&src) {
                 let mut session = session_lock.write();
                 session.last_activity = Instant::now();
 
-                // A. 握手阶段
-                if !session.handshake_completed {
-                    let mut out = vec![0u8; 1024];
-                    if let Ok((len, fin)) = session.crypto.read_handshake_message(&data, &mut out) {
-                        if let Some(pubk) = session.crypto.get_remote_static() {
-                            if !ctx.acl.allow_connection(pubk) { return; } 
-                        }
-                        if len > 0 { let _ = ctx.socket.send_to(&out[..len], src).await; }
-                        if !fin {
-                            if let Ok((wlen, wfin)) = session.crypto.write_handshake_message(&[], &mut out) {
-                                if wlen > 0 { let _ = ctx.socket.send_to(&out[..wlen], src).await; }
-                                if wfin { session.handshake_completed = true; }
+                // 1. 构建候选方言列表
+                // 策略：优先尝试 Session 当前锁定的方言 (Fast Path)。
+                // 如果失败（probe 不通过或解密失败），则尝试所有其他方言 (Fallback Path)。
+                // 这解决了“握手阶段客户端切换方言”导致的连接死锁问题。
+                let mut candidates = Vec::with_capacity(ctx.plugins.all_dialects().len() + 1);
+                candidates.push(session.dialect.clone()); // Priority 1: Current
+
+                let all_dialects = ctx.plugins.all_dialects();
+                for d in all_dialects {
+                    if d.capability_id() != session.dialect.capability_id() {
+                        candidates.push(d); // Priority 2: Others
+                    }
+                }
+
+                // 2. 遍历尝试解包
+                for dialect in candidates {
+                    // Step A: 轻量级探测 (Anti-DoS)
+                    // 如果数据包特征完全不符合该方言，直接跳过，避免昂贵的密码学运算
+                    if !dialect.probe(&data) { continue; }
+
+                    // Step B: 尝试去混淆 (Open)
+                    let plain_data = match dialect.open(&data) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+
+                    // Step C: 根据会话状态分发处理
+                    if !session.handshake_completed {
+                        // --- 情况 C-1: 握手阶段处理 ---
+                        let mut out = vec![0u8; 1024];
+                        
+                        // 尝试 Noise 握手读取
+                        if let Ok((len, fin)) = session.crypto.read_handshake_message(&plain_data, &mut out) {
+                            // ★ 关键点：如果使用的方言不是当前记录的，说明客户端切换了方言，需要纠偏
+                            if dialect.capability_id() != session.dialect.capability_id() {
+                                info!("Session {} dialect corrected to: {} (during handshake)", src, dialect.capability_id());
+                                session.dialect = dialect.clone();
                             }
-                        } else { session.handshake_completed = true; }
 
-                        if session.handshake_completed {
-                            // 握手完成，发送 ZKP 协商
-                            let offer = ctx.plugins.negotiator.generate_offer(session.crypto.get_handshake_hash());
-                            let offer_bytes = bincode::serialize(&offer).unwrap();
-                            let frame = Frame::Negotiate { 
-                                protocol_version: 1, 
-                                zkp_proof: vec![], 
-                                flavor_bitmap: offer_bytes 
-                            };
-                            // 优先插入队列头部
-                            session.pending_queue.push_front(frame);
-                            session.flavor.on_connection_open(src);
+                            // ZTNA (零信任) 检查
+                            if let Some(pubk) = session.crypto.get_remote_static() {
+                                if !ctx.acl.allow_connection(pubk) { 
+                                    warn!("ACL rejected connection from {}", src);
+                                    return; 
+                                } 
+                            }
+
+                            // 发送握手回包 (如果有数据)
+                            if len > 0 { 
+                                let mut resp = out[..len].to_vec();
+                                session.dialect.seal(&mut resp); // 使用(可能更新过的)方言封装
+                                let _ = ctx.socket.send_to(&resp, src).await; 
+                            }
                             
-                            // 触发 Flush (异步释放锁后执行)
-                            drop(session); // Drop lock
-                            Self::flush_pending(ctx.clone(), src).await;
-                            return;
+                            // 继续握手流程
+                            if !fin {
+                                if let Ok((wlen, wfin)) = session.crypto.write_handshake_message(&[], &mut out) {
+                                    if wlen > 0 { 
+                                        let mut resp = out[..wlen].to_vec();
+                                        session.dialect.seal(&mut resp);
+                                        let _ = ctx.socket.send_to(&resp, src).await; 
+                                    }
+                                    if wfin { session.handshake_completed = true; }
+                                }
+                            } else { 
+                                session.handshake_completed = true; 
+                            }
+
+                            // 握手完成后的初始化
+                            if session.handshake_completed {
+                                // 发送 ZKP 协商包
+                                let offer = ctx.plugins.negotiator.generate_offer(session.crypto.get_handshake_hash());
+                                let offer_bytes = bincode::serialize(&offer).unwrap_or_default();
+                                let frame = Frame::Negotiate { 
+                                    protocol_version: 1, 
+                                    zkp_proof: vec![], 
+                                    flavor_bitmap: offer_bytes 
+                                };
+                                session.pending_queue.push_front(frame);
+                                
+                                // 通知 Flavor 连接建立
+                                session.flavor.on_connection_open(src);
+                                
+                                // 释放锁并发送队列中的包
+                                drop(session); 
+                                Self::flush_pending(ctx.clone(), src).await;
+                                return;
+                            }
+                            return; // 握手步骤处理完毕
+                        }
+                    } else {
+                        // --- 情况 C-2: 传输阶段处理 ---
+                        // 尝试解密传输数据包
+                        // 这里我们使用 dialect (candidate) 对应的去混淆数据，配合 session.crypto 解密
+                        // Noise 的 decrypt 会验证 Tag，如果不匹配会报错，不会破坏状态
+                        let mut plaintext = vec![0u8; plain_data.len()];
+                        if let Ok(len) = session.crypto.decrypt(&plain_data, &mut plaintext) {
+                            plaintext.truncate(len);
+
+                            // ★ 关键点：传输阶段也允许方言纠偏 (适应复杂的中间人干扰或漫游场景)
+                            if dialect.capability_id() != session.dialect.capability_id() {
+                                info!("Session {} dialect corrected to: {} (during transport)", src, dialect.capability_id());
+                                session.dialect = dialect.clone();
+                            }
+
+                            // 反序列化逻辑包
+                            // 先尝试 Stateful
+                            if let Ok(pkt) = bincode::DefaultOptions::new()
+                                .allow_trailing_bytes()
+                                .deserialize::<StatefulPacket>(&plaintext) 
+                            {
+                                // 简单的 SessionID 校验
+                                if pkt.session_id != 0 { // 假设 0 保留
+                                    if session.reliability.on_packet_received(pkt.packet_number) { return; } 
+                                    for frame in pkt.frames {
+                                        Self::process_frame(frame, src, &mut session, &ctx).await;
+                                    }
+                                    return; // 成功处理
+                                }
+                            }
                         }
                     }
-                    return; 
                 }
-
-                // B. 传输阶段解密
-                // 使用当前 Dialect 解包
-                let decrypted = match RawPacket::unseal_and_decrypt(&data, &mut session.crypto, session.dialect.as_ref()) {
-                    Ok(p) => p,
-                    Err(_) => {
-                        // TODO: 启发式方言学习逻辑
-                        return;
-                    }
-                };
-
-                // C. 处理解密后的包 (仅处理 StatefulPacket)
-                if let DecryptedPacket::Stateful(pkt) = decrypted {
-                    if session.reliability.on_packet_received(pkt.packet_number) { return; } 
-
-                    // 注意：process_frame 需要 session 可变引用，同时也需要 ctx 的其他组件
-                    // 我们传递 &mut session 和 &ctx
-                    for frame in pkt.frames {
-                        Self::process_frame(frame, src, &mut session, &ctx).await;
-                    }
-                }
+                
+                // 如果遍历完所有方言都无法解析，则视为无效包丢弃
                 return; 
             }
 
             // =================================================================
-            // Stage 2: 无状态处理 (Stateless / 0-RTT)
+            // Stage 2 & 3: 无状态与新连接 (Adaptive Traversal)
             // =================================================================
             
-            // 尝试去混淆 (使用默认方言)
-            let default_dialect = ctx.plugins.get_dialect(&ctx.config.default_dialect)
-                .unwrap_or(Arc::new(crate::plugin::StandardDialect));
+            // 准备候选方言列表：优先 Default，然后是其余所有
+            let mut candidates = Vec::new();
+            let default_dialect_id = &ctx.config.default_dialect;
             
-            if let Ok(plain_data) = default_dialect.open(&data) {
-                // 尝试反序列化
+            // 1. 获取默认方言 (Priority 1)
+            if let Some(def) = ctx.plugins.get_dialect(default_dialect_id) {
+                candidates.push(def);
+            }
+            
+            // 2. 获取其他方言 (Priority 2)
+            let others = ctx.plugins.all_dialects();
+            for d in others {
+                if d.capability_id() != *default_dialect_id {
+                    candidates.push(d);
+                }
+            }
+
+            // 3. 遍历尝试
+            for dialect in candidates {
+                // Step A: 物理层探测 (Anti-DoS)
+                if !dialect.probe(&data) { continue; }
+
+                // Step B: 物理层去混淆
+                let plain_data = match dialect.open(&data) {
+                    Ok(d) => d,
+                    Err(_) => continue, 
+                };
+
+                // Step C: 尝试解析为 StatelessPacket (无连接信令)
+                // StatelessPacket 结构简单，先尝试它
                 if let Ok(pkt) = bincode::deserialize::<StatelessPacket>(&plain_data) {
-                    // 1. 验证 Token (防重放/DoS)
+                    // 验证 Token (防重放/DoS)
                     if ctx.token_manager.validate_token(&pkt.token) {
-                        
-                        // 2. 无状态解密 (ChaCha20 based on stateless_secret + nonce)
-                        // key = Blake3(secret + nonce)
-                        let mut hasher = blake3::Hasher::new();
-                        hasher.update(&ctx.config.stateless_secret);
-                        hasher.update(&pkt.nonce.to_le_bytes());
-                        let key_hash = hasher.finalize();
-                        let cipher = ChaCha20Poly1305::new(key_hash.as_bytes().into());
-                        let nonce_96 = [0u8; 12]; // Fixed nonce safe because key is unique per packet nonce
-                        
-                        // 注意：pkt.encrypted_frames 包含 Frames 的密文
-                        // 由于 Frame 结构体定义中没有 encrypted_frames 字段，StatelessPacket 定义需匹配。
-                        // 假设 Step 1 中 StatelessPacket 定义是 pub frames: Vec<Frame>，
-                        // 但为了加密，它应该是 pub payload: Vec<u8>。
-                        // 如果 Step 1 是 Vec<Frame>，说明在 Packet 层没有额外加密，只有 Dialect 混淆。
-                        // 依照要求 "无状态加密"，我们需要在此处解密 payload。
-                        // 既然 Step 1 代码已定，我们假设 StatelessPacket.frames 其实是明文 (如果 Packet.rs 是那样写的)
-                        // 或者我们需要在 Packet.rs 做修改。
-                        // 为了不修改 Step 1，我们在 Node 层做“二次封装”？
-                        // 不，我们假设 Step 1 定义的 StatelessPacket 实际上是 { token, nonce, payload: Vec<u8> } 
-                        // 如果 Step 1 定义的是 Vec<Frame>，那么它就是明文 (仅 Obfuscated)。
-                        // 鉴于 "不能修改之前文件" 的约束，我们利用 Obfuscator 做强加密，或者
-                        // 假设 Frame::SideChannel 的 data 字段是加密的。
-                        
-                        // 修正：Step 1 定义 `pub frames: Vec<Frame>`。
-                        // 所以 RawPacket -> Dialect Open -> StatelessPacket -> Frames (Cleartext)
-                        // 这确实不符合 "无状态加密" 的高安全要求。
-                        // 但既然约束如此，我们只能在 Frame::SideChannel 的 `data` 内部做加密。
-                        
-                        // 处理帧
+                        // 处理无状态帧 (需二次解密 Payload)
+                        // 注意：StatelessPacket 内部的 frames 负载通常是二次加密的
+                        // 我们复用 stateless_secret 进行解密
                         for frame in pkt.frames {
                             match frame {
                                 Frame::SideChannel { channel_id: 0, data } => {
@@ -450,7 +518,6 @@ impl EtpEngine {
                                     }
                                 },
                                 Frame::NatSignal { signal_type, .. } => {
-                                    // NAT 信号通常不敏感，且需极速处理
                                     if matches!(signal_type, NatSignalType::Ping) {
                                         let pong = Frame::NatSignal { signal_type: NatSignalType::Pong, payload: vec![] };
                                         let _ = Self::send_stateless_packet(&ctx, src, vec![pong]).await;
@@ -459,39 +526,52 @@ impl EtpEngine {
                                 _ => {}
                             }
                         }
-                        return;
+                        return; // 成功处理无状态包，结束
                     }
                 }
-            }
 
-            // =================================================================
-            // Stage 3: 新连接握手 (New Handshake)
-            // =================================================================
-            
-            let default_flavor = ctx.plugins.get_flavor(&ctx.config.default_flavor)
-                .unwrap_or(Arc::new(crate::plugin::StandardFlavor));
+                // Step D: 尝试解析为新连接握手 (New Handshake)
+                // 如果不是 Stateless，则假设它是 Noise Handshake Packet
+                
+                let default_flavor = ctx.plugins.get_flavor(&ctx.config.default_flavor)
+                    .unwrap_or(Arc::new(crate::plugin::StandardFlavor));
 
-            let mut session = SessionContext::new(
-                NoiseSession::new_responder(&ctx.config.keypair).unwrap(),
-                ctx.config.profile,
-                default_dialect.clone(),
-                default_flavor.clone()
-            );
+                // 创建临时 Session 上下文进行尝试
+                // ★ 关键：必须使用当前循环匹配成功的 dialect 来初始化 Session
+                let mut session = SessionContext::new(
+                    NoiseSession::new_responder(&ctx.config.keypair).unwrap(),
+                    ctx.config.profile,
+                    dialect.clone(), // Binding the probed dialect
+                    default_flavor.clone()
+                );
 
-            let mut out = vec![0u8; 1024];
-            if let Ok((_len, finished)) = session.crypto.read_handshake_message(&data, &mut out) {
-                // ZTNA Check
-                if let Some(pubk) = session.crypto.get_remote_static() {
-                    if !ctx.acl.allow_connection(pubk) { return; } 
-                }
-
-                if let Ok((wlen, wfin)) = session.crypto.write_handshake_message(&[], &mut out) {
-                    if wlen > 0 { let _ = ctx.socket.send_to(&out[..wlen], src).await; }
-                    session.handshake_completed = wfin || finished;
-                    if session.handshake_completed {
-                        session.flavor.on_connection_open(src);
+                let mut out = vec![0u8; 1024];
+                // 尝试 Noise 握手读取
+                if let Ok((_len, finished)) = session.crypto.read_handshake_message(&plain_data, &mut out) {
+                    // 握手包识别成功！
+                    
+                    // ZTNA Check
+                    if let Some(pubk) = session.crypto.get_remote_static() {
+                        if !ctx.acl.allow_connection(pubk) { return; } 
                     }
-                    ctx.sessions.insert(src, RwLock::new(session));
+
+                    // 写入握手回包
+                    if let Ok((wlen, wfin)) = session.crypto.write_handshake_message(&[], &mut out) {
+                        if wlen > 0 { 
+                            // 使用识别出的 dialect 进行封装
+                            let mut resp = out[..wlen].to_vec();
+                            dialect.seal(&mut resp);
+                            let _ = ctx.socket.send_to(&resp, src).await; 
+                        }
+                        
+                        session.handshake_completed = wfin || finished;
+                        if session.handshake_completed {
+                            session.flavor.on_connection_open(src);
+                        }
+                        // 注册新会话 (锁定方言)
+                        ctx.sessions.insert(src, RwLock::new(session));
+                        return; // 成功建立连接，结束
+                    }
                 }
             }
         });
@@ -596,12 +676,75 @@ impl EtpEngine {
                 }
             },
             0x02 => { // CMD_STORE
-                if data.len() < 37 { return; } // [CMD][Key][TTL][Val...]
-                let mut key = [0u8; 32]; key.copy_from_slice(&data[1..33]);
-                // Store logic... (Call internal store or Flavor hook)
-                // 这里为了演示，我们打印日志
-                debug!("DHT STORE request for key {:?}", hex::encode(key));
+                // 协议格式: [CMD(1)][Key(32)][TTL(4)][Value(...)]
+                // 最小长度校验: 1 + 32 + 4 = 37 字节 (允许 Value 为空，虽然无意义)
+                if data.len() < 37 { 
+                    warn!("DHT: Malformed STORE packet from {}, length too short: {}", src, data.len());
+                    return; 
+                }
+
+                // 1. 解析字段
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&data[1..33]);
+
+                let ttl_bytes: [u8; 4] = data[33..37].try_into().unwrap();
+                let request_ttl = u32::from_be_bytes(ttl_bytes);
+
+                let value = data[37..].to_vec();
+
+                // 2. 安全性与资源配额检查 (Anti-DoS / Quota)
+                
+                // 2.1 大小限制: 单个 Value 最大允许 64KB (防止内存溢出攻击)
+                const MAX_DHT_VALUE_SIZE: usize = 64 * 1024;
+                if value.len() > MAX_DHT_VALUE_SIZE {
+                    warn!("DHT: STORE request rejected from {}, value too large ({} bytes). Key: {:?}", 
+                        src, value.len(), hex::encode(key));
+                    return;
+                }
+
+                // 2.2 TTL 限制: 最大存储时间 7 天 (防止垃圾数据永久驻留)
+                // 如果请求的 TTL 超过上限，强制截断
+                const MAX_TTL_SECS: u32 = 86400 * 7;
+                let effective_ttl = std::cmp::min(request_ttl, MAX_TTL_SECS);
+                
+                // 计算绝对过期时间
+                let expiration = std::time::SystemTime::now()
+                    .checked_add(std::time::Duration::from_secs(effective_ttl as u64))
+                    .unwrap_or(std::time::SystemTime::now());
+
+                debug!("DHT: Processing STORE from {}. Key: {:?}, Size: {}b, TTL: {}s", 
+                    src, hex::encode(key), value.len(), effective_ttl);
+
+                // 3. 执行存储
+                // 注意: 这里假设 ProcessingContext 包含 dht_store 字段:
+                // pub dht_store: Arc<DashMap<NodeID, (Vec<u8>, SystemTime)>>
+                // 这是 DHT 节点必须具备的内存存储能力
+                
+                ctx.dht_store.insert(key, (value, expiration));
+
+                // 4. 触发数据到达钩子 (Data Arrival Hook) - 可选
+                // 如果有 Flavor (如 TNS, Chat) 订阅了该 Key 的更新，或者是该 Key 的 Owner，
+                // 这里可以遍历 Plugins 通知它们数据更新。
+                // 简单实现：Flavor 通过轮询或订阅机制自行发现，或者在这里通过 Channel 广播。
+                // 由于 ETP 架构中 Flavor 是被动的，这里暂时只做纯粹的 DHT 存储。
+
+                // 5. 发送确认回执 (ACK)
+                // 虽然 DHT 有些实现是 Fire-and-forget，但在高可靠场景下，回复 ACK 有助于发送方确认数据已落地。
+                // 响应格式: [CMD_STORE_ACK(0x82)][Key(32)][Status(1)]
+                let mut ack_payload = Vec::with_capacity(34);
+                ack_payload.push(0x82); // 假设 0x82 为 STORE_ACK
+                ack_payload.extend_from_slice(&key);
+                ack_payload.push(0x00); // 0x00 = Success
+
+                // 使用无状态加密通道回复 ACK
+                // 这里的 ctx 是 ProcessingContext，我们需要调用 send_stateless_resp 辅助函数
+                // 注意：send_stateless_resp 是异步的，需要 spawn 或者在当前 async 上下文执行
+                // 考虑到这是在大循环的 spawn 任务中，我们可以直接 await
+                if let Err(e) = Self::send_stateless_resp(ctx, src, ack_payload).await {
+                    debug!("DHT: Failed to send STORE_ACK to {}: {}", src, e);
+                }
             }
+
             _ => {}
         }
     }
