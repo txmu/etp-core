@@ -15,10 +15,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey, Signer, Verifier, Signature};
 
 use crate::plugin::{Flavor, FlavorContext, CapabilityProvider};
 use crate::NodeID;
-
-// --- 依赖的外部结构适配 (假设 DhtStoreRequest 定义在 chat 中或 common 中) ---
-// 在实际工程中应移至 common，此处为了文件独立性引用或重定义兼容结构
-use crate::plugin::flavors::chat::DhtStoreRequest;
+use crate::common::DhtStoreRequest;
 
 // --- 协议常量 ---
 const TNS_PROTO_VER: u8 = 0x01;

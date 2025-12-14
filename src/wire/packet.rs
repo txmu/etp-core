@@ -17,6 +17,10 @@ use bytes::{Bytes, BytesMut, BufMut};
 use std::sync::Mutex;
 use lazy_static::lazy_static; 
 
+// 引入 Zeroize trait
+#[cfg(feature = "paranoid-security")]
+use zeroize::Zeroize;
+
 type HmacSha256 = Hmac<Sha256>;
 
 // --- 内存池 (Buffer Pool) ---
@@ -41,13 +45,21 @@ impl BufferPool {
             Vec::with_capacity(POOL_PACKET_SIZE)
         }
     }
-
+    
     fn release(&mut self, mut buf: Vec<u8>) {
+        // [新增] 偏执模式：在归还或丢弃前强制物理擦除内存
+        #[cfg(feature = "paranoid-security")]
+        {
+            // Zeroize trait 会将 buf 中的有效数据段 [0..len] 覆写为 0
+            // 这确保了刚才处理的明文/密钥不会残留在堆内存中
+            buf.as_mut_slice().zeroize();
+        }
+
         if self.pool.len() < POOL_CAPACITY && buf.capacity() >= POOL_PACKET_SIZE {
-            buf.clear(); // 保留 capacity
+            buf.clear(); // 逻辑重置 len = 0
             self.pool.push(buf);
         }
-        // 否则 Drop
+        // 否则 Drop (Drop 时内存已在上面被擦除，安全)
     }
 }
 

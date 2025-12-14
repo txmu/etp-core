@@ -1,5 +1,7 @@
 // etp-core/examples/remote_etpnet.rs
 
+#![cfg(feature = "persistence")]
+
 use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::fs;

@@ -1,5 +1,7 @@
 // etp-core/src/examples/original_full_nodes.rs
 
+#![cfg(feature = "persistence")]
+
 use std::sync::Arc;
 use std::net::{SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
@@ -27,7 +29,8 @@ use etp_core::network::socks5::{Socks5Server, RuleBasedRouter, AppSignal};
 
 // --- Flavors ---
 use etp_core::plugin::flavors::vpn::{VpnFlavor, VpnConfig};
-use etp_core::plugin::flavors::chat::{ChatFlavor, DhtStoreRequest};
+use etp_core::plugin::flavors::chat::ChatFlavor;
+use etp_core::common::DhtStoreRequest; 
 use etp_core::plugin::flavors::tns::TnsFlavor;
 use etp_core::plugin::flavors::fileshare::FileShareFlavor;
 use etp_core::plugin::flavors::http_gateway::HttpGatewayFlavor;

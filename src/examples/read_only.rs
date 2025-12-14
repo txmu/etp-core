@@ -1,5 +1,7 @@
 // etp-core/examples/read_only.rs
 
+#![cfg(feature = "persistence")] // 这仅仅是因为该示例演示了一个只读网关，使用了 TnsFlavor 来解析域名。不是要存储什么。
+
 use std::sync::Arc;
 use std::net::SocketAddr;
 use std::path::PathBuf;

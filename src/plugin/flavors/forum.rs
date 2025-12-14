@@ -15,6 +15,7 @@ use rand::Rng;
 
 use crate::plugin::{Flavor, FlavorContext, CapabilityProvider};
 use crate::NodeID;
+use crate::common::DhtStoreRequest;
 
 // --- 协议常量 ---
 const FORUM_PROTO_VER: u8 = 0x01;
@@ -129,14 +130,6 @@ impl PostBloomFilter {
         bytes.copy_from_slice(&hash.as_bytes()[0..8]);
         (u64::from_le_bytes(bytes) as usize) % BLOOM_SIZE_BITS
     }
-}
-
-/// DHT 存储请求
-#[derive(Debug)]
-pub struct DhtStoreRequest {
-    pub key: NodeID,
-    pub value: Vec<u8>,
-    pub ttl_seconds: u32,
 }
 
 /// 论坛存储引擎

@@ -1,5 +1,7 @@
 // etp-core/examples/resilient_etpnet.rs
 
+#![cfg(feature = "persistence")]
+
 use std::sync::Arc;
 use std::net::SocketAddr;
 use std::time::Duration;

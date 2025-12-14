@@ -16,6 +16,7 @@ use blake3;
 use crate::plugin::{Flavor, FlavorContext, CapabilityProvider};
 use crate::crypto::onion::OnionCrypto;
 use crate::NodeID;
+use crate::common::DhtStoreRequest;
 
 // --- 协议常量 ---
 const CHAT_PROTO_VER: u8 = 0x02;
@@ -88,14 +89,6 @@ enum MsgStatus {
     Pending,
     SentToDHT, // 已转为离线投递
     Delivered, // 收到 ACK
-}
-
-/// DHT 离线存储请求
-#[derive(Debug)]
-pub struct DhtStoreRequest {
-    pub key: NodeID,
-    pub value: Vec<u8>,
-    pub ttl_seconds: u32,
 }
 
 /// 聊天存储引擎 (基于 Sled)

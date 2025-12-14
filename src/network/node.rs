@@ -627,20 +627,25 @@ impl EtpEngine {
     pub fn set_fallback_handler(&mut self, handler: Arc<dyn PacketHandler>) {
         self.ctx.fallback_handler = Some(handler);
     }
+    
+    // 找到 impl EtpEngine 块，替换或修改以下方法
 
     pub async fn run(mut self) -> Result<()> {
         let mut tick_interval = tokio::time::interval(Duration::from_millis(DEFAULT_TICK_MS));
-        let mut dht_refresh_interval = tokio::time::interval(DHT_REFRESH_INTERVAL);
+        let mut dht_refresh_interval = tokio::time::interval(Duration::from_secs(600)); // 修正之前的常量未定义问题
         let mut recv_buf = vec![0u8; 65535]; 
+
+        info!("ETP Engine loop started.");
 
         loop {
             tokio::select! {
+                // 1. 网络包接收
                 recv_result = self.ctx.transport.recv_from(&mut recv_buf) => {
                     match recv_result {
                         Ok((len, src)) => {
-                            // Check Ban List (Deep Security)
+                            // Deep Security: Ban List Check
                             if let Some(expiry) = self.ctx.banned_ips.get(&src) {
-                                if Instant::now() < *expiry { continue; } // Silent drop
+                                if Instant::now() < *expiry { continue; } 
                                 else { self.ctx.banned_ips.remove(&src); }
                             }
 
@@ -651,29 +656,80 @@ impl EtpEngine {
                         Err(e) => error!("Transport IO Error: {}", e),
                     }
                 }
+                
+                // 2. 应用层数据发送
                 app_msg = self.data_rx.recv() => {
                     match app_msg {
-                        Some((target, data)) => self.handle_app_data(target, 1, data).await, // Legacy Stream 1
-                        None => break,
+                        Some((target, data)) => self.handle_app_data(target, 1, data).await, 
+                        None => {
+                            info!("Data channel closed, shutting down engine...");
+                            break;
+                        },
                     }
                 }
+                
+                // 3. 控制指令
                 cmd = self.cmd_rx.recv() => {
                     match cmd {
                         Some(cmd) => {
                             if matches!(cmd, Command::Shutdown) {
+                                info!("Received Shutdown command.");
                                 self.handle_shutdown().await;
-                                break;
+                                break; // 退出主循环
                             }
                             self.handle_command(cmd).await;
                         },
-                        None => break,
+                        None => {
+                            info!("Command channel closed, shutting down engine...");
+                            break;
+                        },
                     }
                 }
+                
+                // 4. 定时任务
                 _ = tick_interval.tick() => self.handle_tick().await,
                 _ = dht_refresh_interval.tick() => self.dht_maintenance().await,
+                
+                // 5. (可选) 可以在这里添加 tokio::signal::ctrl_c() 的监听，
+                // 但作为库，最好不要自作主张劫持信号。
             }
         }
+
+        // --- 优雅退出阶段 ---
+        info!("ETP Engine stopping. Cleaning up resources...");
+        
+        // 显式清空 Sessions。
+        // 这会导致所有 SessionContext 被 Drop -> Flavor 被 Drop -> Sled Db 被 Drop -> 数据刷盘。
+        self.ctx.sessions.clear();
+        info!("Sessions cleared. Persistence layers should have flushed.");
+        
         Ok(())
+    }
+
+    /// 优雅停机处理逻辑
+    async fn handle_shutdown(&self) {
+        info!("Broadcasting Close frames to {} active sessions...", self.ctx.sessions.len());
+        
+        // 收集所有活跃连接的地址，避免在迭代中死锁
+        let targets: Vec<SocketAddr> = self.ctx.sessions.iter().map(|k| *k.key()).collect();
+
+        for addr in targets {
+            // 发送 CONNECTION_CLOSE 帧
+            // 这是一个“尽力而为”的操作，不等待 ACK
+            let frame = Frame::Close { 
+                error_code: 0, 
+                reason: "Node Shutdown".into() 
+            };
+            
+            // 使用 send_frames 可能会被流控阻塞，这里我们尝试直接构造一个终结包
+            // 或者简单调用 send_frames 并忽略错误
+            if let Err(e) = self.send_frames(addr, vec![frame]).await {
+                debug!("Failed to send close frame to {}: {}", addr, e);
+            }
+        }
+        
+        // 给网络栈一点时间把包发出去 (50ms)
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     fn spawn_incoming_handler(&self, data: Vec<u8>, src: SocketAddr) {
