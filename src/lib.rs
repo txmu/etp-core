@@ -14,6 +14,13 @@ pub type SessionID = u32;
 pub type PacketNumber = u64;
 pub type Signature = [u8; 64];
 
-// 只有开启了 "ffi" 特性才编译此模块
+// 只有开启了相应特性才编译的模块。警告：除了FFI，其它两个模块都只是初步完成。
+
 #[cfg(feature = "ffi")]
 pub mod ffi;
+
+#[cfg(feature = "extensions")]
+pub mod extensions;
+
+#[cfg(feature = "countermeasures")]
+pub mod countermeasures;
