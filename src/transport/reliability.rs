@@ -1,23 +1,35 @@
 // etp-core/src/transport/reliability.rs
 
-use std::collections::{BTreeMap, VecDeque, HashSet};
+use std::collections::{BTreeMap, VecDeque, HashSet, HashMap};
 use std::time::{Duration, Instant};
 use bytes::Bytes;
 use crate::wire::frame::Frame;
 use crate::PacketNumber;
-use super::congestion::CongestionController;
+use super::congestion::{CongestionControlAlgo, NewReno};
+use super::padding::{PaddingStrategy, NoPadding};
 
 // 配置
 const MAX_SACK_RANGES: usize = 32;
 const MAX_ACK_DELAY_MS: u64 = 25;
-const TIMER_WHEEL_SLOTS: usize = 2048; // 时间轮槽位
-const TIMER_TICK_MS: u64 = 1; // 1ms 精度
+const TIMER_WHEEL_SLOTS: usize = 2048;
+const TIMER_TICK_MS: u64 = 1;
+
+/// 多路复用模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiplexingMode {
+    /// 严格单流模式 (TCP-Like): 无论 Frame 中的 StreamID 是多少，都按到达顺序全局合并。
+    /// 强制 HOL 阻塞，适合伪装成 TLS/TCP，特征最少。
+    StrictSingle,
+    /// 并行多流模式 (QUIC-Like): 每个 StreamID 独立重组，互不阻塞。
+    /// 适合高性能并发传输，尤其是 FakeQUIC 场景。
+    ParallelMulti,
+}
 
 /// 飞行中的包元数据
 #[derive(Debug)]
 struct InFlightPacket {
     sent_time: Instant,
-    frames: Vec<Frame>, // Frame 内部应当持有 Bytes
+    frames: Vec<Frame>,
     size: usize,
     retransmitted: bool,
 }
@@ -26,16 +38,11 @@ struct InFlightPacket {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AckRange(pub u64, pub u64);
 
-/// 高精度时间轮定时器 (Hashed Timing Wheel)
-/// 用于 O(1) 插入和 O(1) 触发超时
+/// 高精度时间轮定时器
 struct TimerWheel {
-    /// 槽位：每个槽是一个 Set，存储在该时间点超时的 PacketNumber
     slots: Vec<HashSet<PacketNumber>>,
-    /// 当前指针位置
     current_tick: usize,
-    /// 启动时间
     start_time: Instant,
-    /// PacketNumber 到 (Tick, ExpiryTime) 的映射，用于取消定时器
     lookup: BTreeMap<PacketNumber, (usize, Instant)>,
 }
 
@@ -50,58 +57,43 @@ impl TimerWheel {
         }
     }
 
-    /// 推进时间并返回超时的包
     fn tick(&mut self) -> Vec<PacketNumber> {
         let now = Instant::now();
         let elapsed_ms = now.duration_since(self.start_time).as_millis() as u64;
         let target_tick = (elapsed_ms / TIMER_TICK_MS) as usize;
         
         let mut expired = Vec::new();
-        
-        // 处理追赶（如果 tick 调用间隔较大）
         while self.current_tick <= target_tick {
             let slot_idx = self.current_tick % TIMER_WHEEL_SLOTS;
-            // 取出当前槽位的所有包
             let ids: Vec<PacketNumber> = self.slots[slot_idx].drain().collect();
-            
             for id in ids {
-                // 验证是否真的超时（处理哈希冲突/多轮次）
                 if let Some((_, expiry)) = self.lookup.get(&id) {
                     if *expiry <= now {
                         expired.push(id);
                         self.lookup.remove(&id);
                     } else {
-                        // 未超时（可能是下一轮的时间），重新放入
-                        // 简化版轮子通常不需要处理这个，因为 insert 会算准 slot
-                        // 这里作为防御
+                        // 未超时，重新调度 (处理时间轮多圈情况或哈希冲突)
+                        // 简化版：这里重新 schedule 会更新 lookup
                         let _ = self.schedule(id, *expiry); 
                     }
                 }
             }
             self.current_tick += 1;
         }
-        
         expired
     }
 
-    /// 安排一个超时任务
     fn schedule(&mut self, pn: PacketNumber, expiry: Instant) {
-        // 先移除旧的
         self.cancel(pn);
-
         let now = Instant::now();
         let delay = if expiry > now { expiry - now } else { Duration::ZERO };
         let delay_ticks = (delay.as_millis() as u64 / TIMER_TICK_MS) as usize;
-        
-        // 计算绝对 tick
         let target_tick = self.current_tick + delay_ticks;
         let slot_idx = target_tick % TIMER_WHEEL_SLOTS;
-
         self.slots[slot_idx].insert(pn);
         self.lookup.insert(pn, (target_tick, expiry));
     }
 
-    /// 取消定时器
     fn cancel(&mut self, pn: PacketNumber) {
         if let Some((tick, _)) = self.lookup.remove(&pn) {
             let slot_idx = tick % TIMER_WHEEL_SLOTS;
@@ -114,7 +106,6 @@ impl TimerWheel {
 #[derive(Debug)]
 pub struct StreamReassembler {
     next_expected_offset: u64,
-    // 使用 Bytes 避免拷贝
     buffer: BTreeMap<u64, Bytes>, 
 }
 
@@ -128,9 +119,8 @@ impl StreamReassembler {
         let end_offset = offset + len;
         
         if end_offset <= self.next_expected_offset {
-            return Vec::new();
+            return Vec::new(); // 既往数据，丢弃
         }
-
         if offset >= self.next_expected_offset {
             self.buffer.insert(offset, data);
         }
@@ -138,13 +128,12 @@ impl StreamReassembler {
         let mut result = Vec::new();
         while let Some(entry) = self.buffer.first_entry() {
             let chunk_offset = *entry.key();
-            
             if chunk_offset == self.next_expected_offset {
                 let chunk = entry.remove();
                 self.next_expected_offset += chunk.len() as u64;
                 result.push(chunk);
             } else if chunk_offset < self.next_expected_offset {
-                // 部分重叠处理 (简化: 丢弃头部重叠部分)
+                // 处理部分重叠
                 let chunk = entry.remove();
                 let overlap = self.next_expected_offset - chunk_offset;
                 if overlap < chunk.len() as u64 {
@@ -153,21 +142,57 @@ impl StreamReassembler {
                     result.push(new_chunk);
                 }
             } else {
-                break;
+                break; // 乱序，等待前序包
             }
         }
         result
     }
 }
 
+/// 流管理器：处理单流或多流策略
+pub enum StreamManager {
+    Single(StreamReassembler),
+    Multi(HashMap<u32, StreamReassembler>),
+}
+
+impl StreamManager {
+    fn new(mode: MultiplexingMode) -> Self {
+        match mode {
+            MultiplexingMode::StrictSingle => StreamManager::Single(StreamReassembler::new()),
+            MultiplexingMode::ParallelMulti => StreamManager::Multi(HashMap::new()),
+        }
+    }
+
+    /// 推送数据片段
+    /// 返回: Vec<(StreamID, DataChunk)>
+    fn push(&mut self, stream_id: u32, offset: u64, data: Bytes) -> Vec<(u32, Vec<u8>)> {
+        match self {
+            StreamManager::Single(reassembler) => {
+                // 单流模式下，强制忽略 stream_id 的差异，全部视为同一流处理 (Sequence必须全局单调)
+                // 这里我们将数据放入唯一的重组器，但返回时仍带上原始 stream_id，
+                // 以便上层 RouterFlavor 可以继续通过 Header 分流。
+                let chunks = reassembler.push(offset, data);
+                chunks.into_iter().map(|b| (stream_id, b.to_vec())).collect() 
+            },
+            StreamManager::Multi(map) => {
+                let reassembler = map.entry(stream_id).or_insert_with(StreamReassembler::new);
+                let chunks = reassembler.push(offset, data);
+                chunks.into_iter().map(|b| (stream_id, b.to_vec())).collect()
+            }
+        }
+    }
+}
+
+/// 可靠性层：集成了 Mod 和 Strategies
 pub struct ReliabilityLayer {
     // --- 发送端 ---
     next_packet_num: PacketNumber,
     sent_queue: BTreeMap<PacketNumber, InFlightPacket>,
     timer_wheel: TimerWheel,
     
-    // 公开拥塞控制器以供上层查询 Pacing
-    pub congestion: CongestionController,
+    // Mods (策略)
+    pub congestion: Box<dyn CongestionControlAlgo>,
+    pub padding_strategy: Box<dyn PaddingStrategy>,
     
     // --- 接收端 ---
     largest_received: PacketNumber,
@@ -175,25 +200,37 @@ pub struct ReliabilityLayer {
     ack_needed: bool,
     ack_alarm: Option<Instant>,
 
-    // --- 应用层流 ---
-    pub reassembler: StreamReassembler,
+    // --- 应用层流管理 ---
+    pub stream_manager: StreamManager,
 }
 
 impl ReliabilityLayer {
-    pub fn new() -> Self {
+    pub fn new(mode: MultiplexingMode) -> Self {
         Self {
             next_packet_num: 1,
             sent_queue: BTreeMap::new(),
             timer_wheel: TimerWheel::new(),
-            congestion: CongestionController::new(),
+            // 默认策略
+            congestion: Box::new(NewReno::new()), 
+            padding_strategy: Box::new(NoPadding),
             
             largest_received: 0,
             received_ranges: VecDeque::new(),
             ack_needed: false,
             ack_alarm: None,
             
-            reassembler: StreamReassembler::new(),
+            stream_manager: StreamManager::new(mode),
         }
+    }
+
+    /// 注入拥塞控制 Mod
+    pub fn set_congestion_algo(&mut self, algo: Box<dyn CongestionControlAlgo>) {
+        self.congestion = algo;
+    }
+
+    /// 注入填充策略 Mod
+    pub fn set_padding_strategy(&mut self, strategy: Box<dyn PaddingStrategy>) {
+        self.padding_strategy = strategy;
     }
 
     pub fn get_next_packet_num(&mut self) -> PacketNumber {
@@ -202,14 +239,19 @@ impl ReliabilityLayer {
         pn
     }
 
-    /// 检查是否可以发送 (综合窗口和 Pacing)
     pub fn can_send(&self) -> bool {
-        self.congestion.can_send_window() && self.congestion.get_pacing_delay() == Duration::ZERO
+        let bytes_inflight = self.sent_queue.values().map(|p| p.size as u64).sum();
+        self.congestion.can_send(bytes_inflight) && self.congestion.get_pacing_delay() == Duration::ZERO
     }
 
-    /// 获取建议的 Pacing 等待时间
     pub fn time_until_send(&self) -> Duration {
         self.congestion.get_pacing_delay()
+    }
+
+    /// 计算建议的填充大小
+    pub fn calculate_padding(&self, current_len: usize) -> usize {
+        let mtu = self.congestion.get_mss() as usize;
+        self.padding_strategy.calculate_padding(current_len, mtu)
     }
 
     pub fn on_packet_sent(&mut self, pn: PacketNumber, frames: Vec<Frame>, size: usize) {
@@ -218,7 +260,6 @@ impl ReliabilityLayer {
         }).collect();
 
         if !reliable_frames.is_empty() {
-            // 注册到 Sent Queue
             self.sent_queue.insert(pn, InFlightPacket {
                 sent_time: Instant::now(),
                 frames: reliable_frames,
@@ -226,18 +267,18 @@ impl ReliabilityLayer {
                 retransmitted: false,
             });
             
-            // 注册超时定时器 (RTO)
-            let rto = self.congestion.current_rto();
+            let rto = self.congestion.get_rto();
             self.timer_wheel.schedule(pn, Instant::now() + rto);
             
-            // 更新拥塞控制
             self.congestion.on_packet_sent(1, size);
         }
     }
 
-    pub fn on_packet_received(&mut self, pn: PacketNumber) -> bool {
+    /// 处理接收包
+    /// 返回: (IsDuplicate, ReassembledData)
+    pub fn on_packet_received(&mut self, pn: PacketNumber, frames: Vec<Frame>) -> (bool, Vec<(u32, Vec<u8>)>) {
         if self.is_duplicate(pn) {
-            return true;
+            return (true, Vec::new());
         }
         if pn > self.largest_received {
             self.largest_received = pn;
@@ -247,7 +288,17 @@ impl ReliabilityLayer {
         if self.ack_alarm.is_none() {
             self.ack_alarm = Some(Instant::now() + Duration::from_millis(MAX_ACK_DELAY_MS));
         }
-        false
+
+        let mut ready_data = Vec::new();
+        // 处理 Frame 中的 Stream 数据
+        for frame in frames {
+            if let Frame::Stream { stream_id, offset, data, .. } = frame {
+                let chunks = self.stream_manager.push(stream_id, offset, Bytes::from(data));
+                ready_data.extend(chunks);
+            }
+        }
+
+        (false, ready_data)
     }
 
     pub fn on_ack_frame_received(&mut self, largest_acked: PacketNumber, ranges: &[(u64, u64)]) {
@@ -269,9 +320,7 @@ impl ReliabilityLayer {
 
         for pn in acked_pns {
             if let Some(pkt) = self.sent_queue.remove(&pn) {
-                // 取消定时器
                 self.timer_wheel.cancel(pn);
-                
                 if !pkt.retransmitted {
                     rtt_sample = Some(now.duration_since(pkt.sent_time));
                 }
@@ -285,33 +334,18 @@ impl ReliabilityLayer {
         }
     }
 
-    /// 获取丢失的帧 (由 Timer Wheel 驱动)
     pub fn get_lost_frames(&mut self) -> Vec<Frame> {
-        // 推进时间轮，获取过期的 PN
         let expired_pns = self.timer_wheel.tick();
-        
         let mut lost_frames = Vec::new();
         let mut has_loss = false;
 
         for pn in expired_pns {
             if let Some(pkt) = self.sent_queue.get_mut(&pn) {
-                // 确认是丢失
                 has_loss = true;
                 lost_frames.extend(pkt.frames.clone());
                 pkt.retransmitted = true;
-                
-                // 重置定时器 (Backoff RTO) - 虽然这里我们可能会移除并重新入队(分配新PN)，
-                // 但如果设计为原地重传，则需要重新 schedule。
-                // ETP 策略：将 Frames 取出，分配新 PN 发送。旧 PN 留在队列中等待最终清理或由于 RTO 依然没 ACK 而被视为彻底丢失。
-                // 为了简化，这里我们标记为 retransmitted，并不移除旧条目，防止对旧 ACK 的误判 RTT。
-                // 但我们不再为旧 PN 调度定时器。
             }
-            // 从 sent_queue 移除？通常 QUIC 也是保留直到确认或彻底放弃。
-            // 这里简化：取出 Frame 重新发送，旧 PN 记录仅用于去重，不再追踪超时。
             self.sent_queue.remove(&pn); 
-            if self.congestion.bytes_in_flight > 0 {
-                 self.congestion.bytes_in_flight -= 1; 
-            }
         }
 
         if has_loss {
