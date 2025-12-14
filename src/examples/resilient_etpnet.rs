@@ -1,13 +1,16 @@
 // etp-core/examples/resilient_etpnet.rs
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::sync::mpsc;
-use log::{info, debug};
+use log::{info, error, warn, debug};
 use env_logger::Env;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, Context};
+use rand::Rng;
 
-use etp_core::network::node::{EtpEngine, NodeConfig, EtpHandle};
+// ETP Core Imports
+use etp_core::network::node::{EtpEngine, NodeConfig, DeepSecurityConfig};
 use etp_core::crypto::noise::KeyPair;
 use etp_core::plugin::{PluginRegistry, CapabilityProvider, Dialect};
 use etp_core::plugin::flavors::composite::CompositeFlavor;
@@ -15,33 +18,20 @@ use etp_core::plugin::flavors::chat::ChatFlavor;
 use etp_core::transport::reliability::MultiplexingMode;
 use etp_core::transport::shaper::SecurityProfile;
 
-// 引入对抗模块
-use etp_core::countermeasures::mimicry::MimicryEngine;
-use etp_core::countermeasures::sequence::SequenceShaper;
-use etp_core::countermeasures::qos::QosGuardian;
+// Config & Extensions
+use etp_core::extensions::{ConfigManager, DynamicConfig};
+use etp_core::extensions::config::EnsProvider;
+
+// Conditional Import for ENS Gateway Sidecar
+#[cfg(feature = "ens-gateway")]
+use etp_core::extensions::{EnsGatewayConfig, run_ens_gateway};
 
 // ============================================================================
-//  定义对抗型方言: "MimicTlsDialect"
-//  功能：伪装成 TLS 1.3 握手序列，并具备抗 QoS 能力
+//  1. 自定义对抗型方言 (Mimic TLS 1.3)
 // ============================================================================
 
 #[derive(Debug)]
-struct MimicTlsDialect {
-    // 序列整形器：控制发包长度
-    // 使用 Mutex 因为 Dialect 需要内部可变性来更新 packet_count
-    shaper: Mutex<SequenceShaper>,
-    // QoS 守卫：监测网络质量
-    qos: Mutex<QosGuardian>,
-}
-
-impl MimicTlsDialect {
-    fn new() -> Self {
-        Self {
-            shaper: Mutex::new(SequenceShaper::new()),
-            qos: Mutex::new(QosGuardian::new()),
-        }
-    }
-}
+struct MimicTlsDialect;
 
 impl CapabilityProvider for MimicTlsDialect {
     fn capability_id(&self) -> String { "etp.dialect.mimic.tls.v1".into() }
@@ -49,139 +39,177 @@ impl CapabilityProvider for MimicTlsDialect {
 
 impl Dialect for MimicTlsDialect {
     fn seal(&self, payload: &mut Vec<u8>) {
-        let mut shaper = self.shaper.lock().unwrap();
-        let mut qos = self.qos.lock().unwrap();
+        // 模拟 TLS Application Data (0x17)
+        // Header: [Type: 0x17] [Ver: 0x0303] [Len: u16]
+        let len = (payload.len() as u16).to_be_bytes();
+        let mut header = Vec::with_capacity(5);
+        header.push(0x17);       // Content Type: Application Data
+        header.push(0x03);       // Version Major
+        header.push(0x03);       // Version Minor (TLS 1.2 legacy mapping for 1.3)
+        header.extend_from_slice(&len);
 
-        // 1. QoS 检查与标记
-        qos.mark_sent(); // 记录发送时间
-        
-        // 如果 QoS 检测到高丢包或抖动，可以在此增加冗余
-        // (注：ETP Core 的 ReliabilityLayer 负责重传，这里Dialect层做的是 FEC 或 额外 Padding)
-        let _fec_ratio = qos.calculate_dynamic_fec();
-
-        // 2. 序列整形 (Sequence Shaping)
-        // 询问 Shaper：为了像 TLS，下一个包应该多大？
-        if let Some(target_len) = shaper.next_target_len() {
-            // 如果是首包，我们需要生成 Fake ClientHello
-            if target_len == 517 { // 约定的 ClientHello 长度
-                // 将真实 payload 藏在 extension 或 加密部分？
-                // 这里的简化实现：
-                // 使用 MimicryEngine 生成头部，然后将 Payload 附在后面
-                // 并填充 Padding 到 target_len
-                
-                let mut header = MimicryEngine::generate_tls_client_hello("www.google.com");
-                
-                // 将真实 Payload 混淆后追加
-                // 注意：真实场景中需要更复杂的 steganography，这里简单追加
-                header.extend_from_slice(payload);
-                
-                // 填充到目标长度
-                if header.len() < target_len {
-                    header.resize(target_len, 0x00);
-                }
-                *payload = header;
-                return;
-            }
-            
-            // 对于后续包，应用长度填充
-            if payload.len() < target_len {
-                // 使用符合 TLS 密文分布的随机数填充
-                etp_core::countermeasures::entropy::EntropyReducer::inject_printable_chaff(payload, target_len);
-            }
-        } else {
-            // 握手模拟阶段结束，进入普通数据传输
-            // 可以加上普通的 TLS Application Data Header (0x17 0x03 0x03 ...)
-            let mut prefix = vec![0x17, 0x03, 0x03];
-            let len = (payload.len() as u16).to_be_bytes();
-            prefix.extend_from_slice(&len);
-            
-            let mut new_vec = prefix;
-            new_vec.extend_from_slice(payload);
-            *payload = new_vec;
-        }
+        // 原地修改：Header + Payload
+        let mut new_packet = Vec::with_capacity(5 + payload.len());
+        new_packet.extend(header);
+        new_packet.append(payload);
+        *payload = new_packet;
     }
 
     fn open(&self, data: &[u8]) -> Result<Vec<u8>> {
-        // 解包逻辑：
-        // 1. 如果是首包 (0x16 0x03)，剥离 ClientHello 伪装
-        if data.len() > 5 && data[0] == 0x16 && data[1] == 0x03 {
-            // 这是一个 Fake TLS Handshake
-            // 真实数据藏在尾部或者特定位置。
-            // 这里为了演示，假设我们简单地丢弃了前 100 字节的 Fake Header？
-            // 实际上需要一个协议约定来定位真实 payload。
-            // 简化：假设 MimicryEngine 生成的头是固定长度或可解析的。
-            // 这里我们直接返回 Slice (假设测试环境能对齐)
-            // 在生产中，我们会使用一个特殊的 Magic 或 Length-Prefix 藏在里面。
-            
-            // 为了让 Example 能跑通握手，这里做一个假设：
-            // 我们的 Noise 握手包被追加在 Fake ClientHello 后面。
-            // 我们尝试寻找 Noise 协议特征或简单切片。
-            // 这是一个 Hack，仅用于演示 Sequence Shaping 的概念。
-            return Ok(data.to_vec()); // 暂时透传，依靠 Noise 层去试错
+        // 校验 TLS 头部特征
+        if data.len() < 5 {
+            return Err(anyhow!("Packet too short for TLS header"));
         }
-        
-        // 2. 如果是数据包 (0x17 0x03)，剥离头
-        if data.len() > 5 && data[0] == 0x17 {
-            return Ok(data[5..].to_vec());
+        if data[0] != 0x17 || data[1] != 0x03 {
+            return Err(anyhow!("Invalid TLS Record Header"));
         }
-
-        Ok(data.to_vec())
+        // 提取 Payload
+        Ok(data[5..].to_vec())
     }
 
     fn probe(&self, data: &[u8]) -> bool {
-        // 探测是否看起来像 TLS
-        data.len() >= 3 && ((data[0] == 0x16) || (data[0] == 0x17))
+        // 快速特征匹配
+        data.len() >= 5 && data[0] == 0x17 && data[1] == 0x03
     }
 }
 
 // ============================================================================
-//  主程序
+//  2. 辅助函数：环境准备
+// ============================================================================
+
+fn get_trust_anchor() -> String {
+    // 优先从环境变量读取生产环境的公钥
+    match std::env::var("ETP_ADMIN_PUBKEY") {
+        Ok(key) => {
+            info!("Trust Anchor loaded from environment variable.");
+            key
+        },
+        Err(_) => {
+            // 如果未配置，生成一个临时的有效公钥以保证程序能跑通 (演示模式)
+            warn!("ETP_ADMIN_PUBKEY not set. Generating temporary trust anchor for demonstration.");
+            let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+            hex::encode(signing_key.verifying_key())
+        }
+    }
+}
+
+fn get_rpc_endpoint() -> String {
+    std::env::var("ETH_RPC_URL")
+        .unwrap_or_else(|_| "https://eth-mainnet.public.blastapi.io".to_string())
+}
+
+// ============================================================================
+//  3. 主程序入口
 // ============================================================================
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 1. 初始化日志系统
     env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
-    info!("=== ETP Resilient Net (Anti-Trojan/QoS Mode) ===");
+    info!("=== ETP Resilient Node (Production) ===");
 
-    // 1. 注册插件
-    let registry = Arc::new(PluginRegistry::new());
-    registry.register_dialect(Arc::new(MimicTlsDialect::new()));
+    // 2. 启动 Sidecar 服务 (ENS Gateway)
+    // 这是一个独立的微服务，负责将 HTTP 协议转换为 Ethereum JSON-RPC 协议
+    let gateway_port = 3050;
+    let gateway_url = format!("http://127.0.0.1:{}", gateway_port);
 
-    // 2. 组装业务：ETPNet (Chat + TNS)
-    let (chat_tx, _chat_rx) = mpsc::channel(100);
-    let (dht_tx, _dht_rx) = mpsc::channel(100);
-    
-    // 初始化 Chat Flavor
-    let keys = KeyPair::generate();
-    let key_bytes: [u8;32] = keys.private.as_slice().try_into()?;
-    let chat = ChatFlavor::new(
-        "etpnet_chat.db", &key_bytes, &key_bytes, dht_tx.clone(), chat_tx
-    )?;
-    
-    // 使用 Composite Flavor 复用连接
-    let composite = Arc::new(CompositeFlavor::new(chat.clone()));
-    composite.bind_stream(2, chat.clone()); // Stream 2 for Chat
-    registry.register_flavor(composite);
+    #[cfg(feature = "ens-gateway")]
+    {
+        let ens_conf = EnsGatewayConfig {
+            bind_addr: format!("127.0.0.1:{}", gateway_port).parse().context("Invalid Gateway Bind Address")?,
+            eth_rpc_url: get_rpc_endpoint(),
+            timeout_secs: 15,
+        };
 
-    // 3. 节点配置：高弹性与混淆
+        info!("Sidecar: Spawning ENS Gateway on {}...", gateway_port);
+        // 使用 tokio::spawn 运行 Sidecar，使其不阻塞主线程
+        tokio::spawn(async move {
+            run_ens_gateway(ens_conf).await;
+        });
+
+        // 等待 Sidecar 端口就绪 (简单的自旋检查)
+        let start = std::time::Instant::now();
+        loop {
+            if std::net::TcpStream::connect(format!("127.0.0.1:{}", gateway_port)).is_ok() {
+                debug!("Sidecar is ready.");
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(5) {
+                warn!("Sidecar startup timed out, proceeding anyway (requests might fail).");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[cfg(not(feature = "ens-gateway"))]
+    {
+        warn!("Feature 'ens-gateway' is disabled. Ensure an external gateway is running at {}", gateway_url);
+    }
+
+    // 3. 初始化配置管理器
+    // 加载信任锚点 (Admin Public Key) 用于验证远程配置签名
+    let trust_anchor_hex = get_trust_anchor();
+    let mut config_mgr = ConfigManager::new(serde_json::json!({}), Some(trust_anchor_hex))
+        .context("Failed to initialize ConfigManager")?;
+
+    // 注册标准配置提供者
+    config_mgr.register_defaults();
+
+    // 注册 ENS 提供者，指向上一步启动的本地 Gateway
+    // 该 Provider 负责处理 ens:// 协议，通过 HTTP 请求本地网关
+    config_mgr.register_provider(EnsProvider {
+        rpc_url: gateway_url,
+        client: reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?,
+    });
+
+    // 4. 远程配置加载
+    // 逻辑流: ens://resilient.etp -> Gateway -> (Resolve) -> ipfs://QmHash -> IpfsProvider -> (Verify Sig) -> Config
+    let config_uri = std::env::var("ETP_CONFIG_URI").unwrap_or_else(|_| "ens://resilient-node.etp".to_string());
+    info!("Bootstrapping: Loading configuration from {}", config_uri);
+
+    if let Err(e) = config_mgr.load_from_uri(&config_uri) {
+        // 在生产环境中，配置加载失败通常意味着无法安全启动。
+        // 但为了保证节点的可用性，这里降级使用默认配置并发出告警。
+        error!("CRITICAL: Failed to load remote config: {}. Using hardcoded defaults.", e);
+    } else {
+        info!("Remote configuration loaded and verified successfully.");
+    }
+
+    // 获取最新的动态配置快照
+    let dyn_cfg = config_mgr.get_config();
+
+    // 5. 节点参数组装
+    // 优先使用动态配置中的值，缺省使用安全默认值
+    let bind_port = dyn_cfg.get::<u16>("network.port").unwrap_or(8443);
+    let rekey_interval = dyn_cfg.get::<u64>("security.rekey_interval").unwrap_or(600);
+    let cover_traffic = dyn_cfg.get::<bool>("anonymity.enable_cover_traffic").unwrap_or(true);
+
+    let node_keys = KeyPair::generate();
+    info!("Node Identity Generated: {}", hex::encode(blake3::hash(&node_keys.public).as_bytes()));
+
     let config = NodeConfig {
-        bind_addr: "0.0.0.0:8443".to_string(), // 8443 常用 TLS 端口
-        keypair: keys,
+        bind_addr: format!("0.0.0.0:{}", bind_port),
+        keypair: node_keys.clone(),
         
-        // A. 多流模式：ParallelMulti (类 QUIC)
-        // 抗干扰能力强，单一流丢包不阻塞其他流
-        multiplexing_mode: MultiplexingMode::ParallelMulti,
+        // 抗干扰核心配置
+        multiplexing_mode: MultiplexingMode::ParallelMulti, // 多流并发，避免队头阻塞
+        profile: SecurityProfile::Balanced,                 // 平衡延迟与特征隐藏
         
-        // B. 流量整形：Balanced
-        // 不强制恒定码率，但是引入随机抖动，配合 SequenceShaper 模拟真实用户行为
-        profile: SecurityProfile::Balanced,
-
-        // C. 深度安全配置
-        // 拒绝非白名单的握手，防止主动探测
-        security: etp_core::network::node::DeepSecurityConfig {
-            strict_rekey_interval_secs: 600, // 10分钟换一次密钥
-            handshake_zero_tolerance: true,  // 收到非法包直接拉黑 IP
+        // 深度安全配置
+        security: DeepSecurityConfig {
+            strict_rekey_interval_secs: rekey_interval,
+            handshake_zero_tolerance: true,                 // 零容忍：非法握手直接拉黑 IP
             allow_dynamic_side_channels: true,
+        },
+        
+        // 深度匿名配置
+        anonymity: etp_core::network::node::DeepAnonymityConfig {
+            enable_cover_traffic: cover_traffic,
+            target_min_bitrate: 10 * 1024, // 10KB/s 底噪
+            jitter_ms_range: (5, 25),      // 随机抖动
         },
 
         default_dialect: "etp.dialect.mimic.tls.v1".to_string(),
@@ -190,12 +218,48 @@ async fn main() -> Result<()> {
         ..NodeConfig::default()
     };
 
-    // 4. 启动
-    let (engine, _handle, _) = EtpEngine::new(config, registry).await?;
-
-    info!("ETPNet Node Running.");
-    info!("Countermeasures Active: Sequence Shaping (FakeTLS), QoS Guardian, Zero Tolerance");
+    // 6. 插件体系组装
+    let registry = Arc::new(PluginRegistry::new());
     
+    // 注册拟态方言
+    registry.register_dialect(Arc::new(MimicTlsDialect));
+
+    // 组装业务层 (Chat + DHT + Composite)
+    let (chat_tx, _chat_rx) = mpsc::channel(2048);
+    let (dht_tx, _dht_rx) = mpsc::channel(1024);
+    
+    let key_bytes: [u8; 32] = node_keys.private.as_slice().try_into()
+        .map_err(|_| anyhow!("Invalid Key Length"))?;
+
+    // 初始化聊天模块 (持久化存储)
+    let chat_flavor = ChatFlavor::new(
+        "resilient_chat.db", 
+        &key_bytes, 
+        &key_bytes, 
+        dht_tx, 
+        chat_tx
+    ).context("Failed to initialize ChatFlavor")?;
+
+    // 初始化复合分流器
+    let composite = Arc::new(CompositeFlavor::new(chat_flavor.clone()));
+    
+    // 绑定 Stream ID 2 为聊天专用流
+    composite.bind_stream(2, chat_flavor.clone());
+    
+    // 注册入口 Flavor
+    registry.register_flavor(composite);
+
+    // 7. 启动内核引擎
+    info!("Initializing ETP Kernel...");
+    let (engine, _handle, _) = EtpEngine::new(config, registry).await
+        .context("Failed to start ETP Engine")?;
+
+    info!("ETP Resilient Node is running.");
+    info!("Listening Port: {}", bind_port);
+    info!("Features Active: ENS-Config, MimicTLS, ParallelMulti, CoverTraffic");
+
+    // 8. 阻塞运行
     engine.run().await?;
+
     Ok(())
 }

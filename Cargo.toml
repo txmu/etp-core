@@ -1,6 +1,6 @@
 [package]
 name = "etp-core"
-version = "1.1.0"
+version = "1.1.2"
 edition = "2025"
 authors = ["ETP Core Team"]
 description = "Evolutionary Transport Protocol Core Library"
@@ -20,6 +20,7 @@ countermeasures = []
 vpn = ["tun"]
 anonymity = ["tokio-util"]
 xdp = ["aya", "aya-log", "etherparse", "nix"]
+ens-gateway = ["ethers", "warp"]
 
 [dependencies]
 libc = { version = "0.2", optional = false }
@@ -85,6 +86,13 @@ regex = { version = "1.9", optional = true }
 # --- Optional: Anonymity Module ---
 # 用于 Tor/I2P 的 SOCKS5 握手和 TCP 封包处理
 tokio-util = { version = "0.7", features = ["codec"], optional = true } 
+
+# --- Optional: ENS Gateway Dependencies---
+# ethers: 以太坊交互全家桶 (只启用必要特性以减小体积)
+ethers = { version = "2.0", features = ["rustls"], optional = true }
+# warp: 轻量级、基于 Filter 的 HTTP 服务器
+warp = { version = "0.3", optional = true }
+thiserror = "1.0" # 建议添加，用于简化错误定义
 
 # --- Platform Specific Dependencies ---
 
