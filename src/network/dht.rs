@@ -126,29 +126,25 @@ impl Ord for Distance {
 struct VirtualNetworkMapper;
 
 impl VirtualNetworkMapper {
-    /// 确定性映射
-    /// 规则：
-    /// 1. 基础网段 240.0.0.0 (0xF0000000)
-    /// 2. 取 NodeID 的后 28 位作为后缀
-    /// 3. 如果结果落入 255.x.x.x (保留广播)，则重映射到 254.x.x.x
     pub fn map_id_to_ip(id: &NodeID) -> Ipv4Addr {
         let len = id.len();
-        // 取最后 4 个字节
-        let mut bytes = [id[len-4], id[len-3], id[len-2], id[len-1]];
+        // 取 NodeID 的最后 4 字节
+        let mut b = [id[len-4], id[len-3], id[len-2], id[len-1]];
         
-        // 强制高 4 位为 1111 (Class E, 240-255)
-        // 实际上 240.0.0.0/4 的范围是 240.0.0.0 - 255.255.255.255
-        // 我们需要 240.0.0.0 (0xF0)
-        
-        // 保留后 28 位，首字节高 4 位设为 1111 (0xF0)
-        bytes[0] = (bytes[0] & 0x0F) | 0xF0;
-
-        // 排除 255.x.x.x (广播/未来保留)
-        if bytes[0] == 255 {
-            bytes[0] = 254; 
+        // 核心位运算：
+        // mask 0xF0 (11110000) 确保它是 Class E
+        // mask 0x0F (00001111) 保留 NodeID 该字节的低4位随机性
+        b[0] = (b[0] & 0x0F) | 0xF0;
+    
+        // 边界处理：
+        // Class E 的范围是 240.0.0.0 - 255.255.255.255
+        // 操作系统通常极其讨厌 255.x.x.x (广播风暴风险)
+        // 所以如果首字节是 255，我们将其重映射回 254 (或者 240，看喜好，254 碰撞概率最小)
+        if b[0] == 255 {
+            b[0] = 254;
         }
-
-        Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])
+    
+        Ipv4Addr::new(b[0], b[1], b[2], b[3])
     }
 }
 

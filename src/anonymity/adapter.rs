@@ -3,13 +3,13 @@
 use std::sync::Arc;
 use std::net::{SocketAddr, IpAddr, Ipv4Addr};
 use std::collections::HashMap;
-use std::time::Duration;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, Mutex, RwLock};
-use tokio::time::timeout;
+use tokio::time::{timeout, interval};
 use async_trait::async_trait;
 use log::{info, warn, error, debug, trace};
 use anyhow::{Result, anyhow, Context};
@@ -17,17 +17,29 @@ use dashmap::DashMap;
 
 use crate::network::node::PacketTransport;
 
-// --- 配置常量 ---
+// ============================================================================
+//  配置常量
+// ============================================================================
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const TUNNEL_IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5分钟无流量自动断开
+const GC_INTERVAL: Duration = Duration::from_secs(60);          // 每分钟执行一次 GC
 const MAX_FRAME_SIZE: usize = 65535;
-const VIRTUAL_IP_PREFIX: u8 = 240; // 240.0.0.0/8 (Class E) reserved for Tor mapping
 
 // ============================================================================
-//  1. SOCKS5 协议工具
+//  1. SOCKS5 协议工具 (带 TCP 调优)
 // ============================================================================
 
 async fn socks5_handshake(proxy: SocketAddr, target_host: &str, target_port: u16) -> Result<TcpStream> {
     let stream = TcpStream::connect(proxy).await?;
+    
+    // [Feature: TCP Optimization]
+    // 禁用 Nagle 算法，因为我们在隧道中传输的是实时包，不需要 TCP 帮我们合并小包
+    stream.set_nodelay(true).context("Failed to set TCP_NODELAY")?;
+    // 设置缓冲区大小，优化吞吐量
+    let _ = stream.set_recv_buffer_size(64 * 1024);
+    let _ = stream.set_send_buffer_size(64 * 1024);
+
     let mut stream = stream; // pin
 
     // 1. Auth Negotiation
@@ -73,27 +85,32 @@ async fn socks5_handshake(proxy: SocketAddr, target_host: &str, target_port: u16
 
 // ============================================================================
 //  2. 动态 Tor 传输层 (TorDynamicTransport)
-//  能够为不同的目标地址建立独立的 SOCKS5 隧道，并维护连接池
+//  支持：自动电路建立、空闲回收、Class E 映射
 // ============================================================================
+
+/// 隧道元数据 (用于健康检查)
+#[derive(Debug)]
+struct TunnelState {
+    tx: mpsc::Sender<Vec<u8>>,
+    /// 最后一次发送/接收数据的时间戳 (用于 GC)
+    last_active: Arc<AtomicU64>,
+}
 
 #[derive(Debug)]
 pub struct TorDynamicTransport {
     /// 本地代理地址
     proxy_addr: SocketAddr,
     
-    /// 活跃隧道映射表: TargetAddr -> MpscSender (发送数据帧到 Writer Task)
-    /// 注意：这里的 TargetAddr 是 ETP 视角的地址 (可能是虚拟 IP)
-    tunnels: Arc<DashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>,
+    /// 活跃隧道映射表: TargetAddr (Virtual IP) -> TunnelState
+    tunnels: Arc<DashMap<SocketAddr, TunnelState>>,
     
     /// 接收数据汇聚通道 (所有 Tunnel 的 Reader Task 都把数据发到这里)
-    /// 必须用 Mutex 保护 Receiver 以满足 Sync
     rx_queue: Arc<Mutex<mpsc::Receiver<(Vec<u8>, SocketAddr)>>>,
     
     /// 内部发送端 (克隆给 Reader Task)
     tx_internal: mpsc::Sender<(Vec<u8>, SocketAddr)>,
 
-    /// 虚拟地址映射器 (解决 .onion 域名无法放入 SocketAddr 的问题)
-    /// VirtualIP (240.x.x.x) <-> DomainString
+    /// 虚拟地址映射器
     dns_mapper: Arc<VirtualDnsMapper>,
 }
 
@@ -102,17 +119,47 @@ impl TorDynamicTransport {
         let proxy: SocketAddr = proxy_addr.parse().context("Invalid proxy address")?;
         let (tx, rx) = mpsc::channel(4096); // 全局接收缓冲
 
-        Ok(Arc::new(Self {
+        let transport = Arc::new(Self {
             proxy_addr: proxy,
             tunnels: Arc::new(DashMap::new()),
             rx_queue: Arc::new(Mutex::new(rx)),
             tx_internal: tx,
             dns_mapper: Arc::new(VirtualDnsMapper::new()),
-        }))
+        });
+
+        // [Feature: Idle Tunnel Reaper]
+        // 启动后台 GC 任务，清理僵尸连接
+        let t_clone = transport.clone();
+        tokio::spawn(async move {
+            let mut interval = interval(GC_INTERVAL);
+            loop {
+                interval.tick().await;
+                t_clone.run_garbage_collection();
+            }
+        });
+
+        Ok(transport)
+    }
+
+    /// 执行垃圾回收
+    fn run_garbage_collection(&self) {
+        let now = current_timestamp();
+        let timeout = TUNNEL_IDLE_TIMEOUT.as_secs();
+        
+        // DashMap retain 是安全的并发清理方式
+        // 移除那些 (now - last_active) > timeout 的隧道
+        self.tunnels.retain(|addr, state| {
+            let last = state.last_active.load(Ordering::Relaxed);
+            if now.saturating_sub(last) > timeout {
+                debug!("TorTransport: Reaping idle tunnel to {}", addr);
+                false // Remove
+            } else {
+                true // Keep
+            }
+        });
     }
 
     /// 注册一个 Onion 域名，获取一个虚拟 IP
-    /// 上层业务 (Flavor/Discovery) 必须调用此方法来解析 .onion 地址
     pub fn map_domain(&self, domain: &str) -> SocketAddr {
         self.dns_mapper.get_or_create_ip(domain)
     }
@@ -123,30 +170,37 @@ impl TorDynamicTransport {
     }
 
     /// 建立新隧道 (内部方法)
-    async fn connect_tunnel(&self, target_virtual: SocketAddr) -> Result<mpsc::Sender<Vec<u8>>> {
+    async fn connect_tunnel(&self, target_virtual: SocketAddr) -> Result<TunnelState> {
         // 1. 解析目标
         let (host, port) = self.resolve_ip(&target_virtual)
             .ok_or_else(|| anyhow!("Target IP {} is not a mapped virtual address", target_virtual))?;
 
         debug!("TorTransport: Dialing tunnel to {}:{} via {}...", host, port, self.proxy_addr);
 
-        // 2. 执行 SOCKS5 握手
+        // 2. 执行 SOCKS5 握手 (带超时)
         let stream = timeout(CONNECT_TIMEOUT, socks5_handshake(self.proxy_addr, &host, port)).await??;
         
         let (mut reader, mut writer) = tokio::io::split(stream);
         let (tx_frame, mut rx_frame) = mpsc::channel::<Vec<u8>>(1024); // 单个隧道的发送队列
+        
+        let last_active = Arc::new(AtomicU64::new(current_timestamp()));
 
         // 3. 启动 Writer Task (App -> Tunnel)
         let target_clone = target_virtual;
         let tunnels_map = self.tunnels.clone();
+        let active_writer = last_active.clone();
         
         tokio::spawn(async move {
             while let Some(data) = rx_frame.recv().await {
-                // Framing: [Len u16][Data]
                 if data.len() > MAX_FRAME_SIZE {
                     warn!("TorTransport: Frame too large, dropping.");
                     continue;
                 }
+                
+                // Update Activity
+                active_writer.store(current_timestamp(), Ordering::Relaxed);
+
+                // Protocol: Length-Prefixed Framing inside TCP
                 let len = (data.len() as u16).to_be_bytes();
                 if let Err(e) = writer.write_all(&len).await.and_then(|_| writer.write_all(&data).await) {
                     error!("TorTransport: Write error to {}: {}", target_clone, e);
@@ -160,6 +214,8 @@ impl TorDynamicTransport {
 
         // 4. 启动 Reader Task (Tunnel -> App)
         let tx_main = self.tx_internal.clone();
+        let active_reader = last_active.clone();
+        
         tokio::spawn(async move {
             let mut len_buf = [0u8; 2];
             loop {
@@ -171,8 +227,10 @@ impl TorDynamicTransport {
                 let mut buf = vec![0u8; len];
                 if reader.read_exact(&mut buf).await.is_err() { break; }
                 
+                // Update Activity
+                active_reader.store(current_timestamp(), Ordering::Relaxed);
+
                 // Forward to main engine
-                // 注意：我们将 Source 标记为 Virtual IP，这样 Engine 回包时会再次查表
                 if tx_main.send((buf, target_clone)).await.is_err() {
                     break; // Engine shutdown
                 }
@@ -180,26 +238,31 @@ impl TorDynamicTransport {
             debug!("TorTransport: Tunnel reader closed for {}", target_clone);
         });
 
-        Ok(tx_frame)
+        Ok(TunnelState {
+            tx: tx_frame,
+            last_active,
+        })
     }
 }
 
 #[async_trait]
 impl PacketTransport for TorDynamicTransport {
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
-        // 1. 检查是否存在活跃隧道
+        // 1. 尝试获取现有隧道
         // 使用 DashMap 的 get 或 entry api
         // 由于 create_tunnel 是 async 的，不能直接在 entry closure 里调用
         
-        let tx = if let Some(sender) = self.tunnels.get(&target) {
-            sender.clone()
+        let tx = if let Some(state) = self.tunnels.get(&target) {
+            // 更新活跃时间
+            state.last_active.store(current_timestamp(), Ordering::Relaxed);
+            state.tx.clone()
         } else {
             // 需要新建连接
-            // 注意：这里可能存在并发建立连接的问题，但在 DashMap 下可接受，多余的会被覆盖或丢弃
             match self.connect_tunnel(target).await {
-                Ok(sender) => {
-                    self.tunnels.insert(target, sender.clone());
-                    sender
+                Ok(state) => {
+                    let tx = state.tx.clone();
+                    self.tunnels.insert(target, state);
+                    tx
                 }
                 Err(e) => {
                     return Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e.to_string()));
@@ -208,15 +271,14 @@ impl PacketTransport for TorDynamicTransport {
         };
 
         // 2. 发送数据到 Writer Task
-        // 使用 try_send 避免阻塞 Engine 核心循环
-        // 如果 Channel 满，说明 Tor 网络阻塞，丢包是合理的 (Backpressure)
         match tx.try_send(buf.to_vec()) {
             Ok(_) => Ok(buf.len()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                // Backpressure: Tunnel is congested
                 Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "Tunnel buffer full"))
             },
             Err(_) => {
-                // Channel closed, remove and retry next time
+                // Channel closed, clean up map and retry next time
                 self.tunnels.remove(&target);
                 Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "Tunnel closed"))
             }
@@ -235,7 +297,6 @@ impl PacketTransport for TorDynamicTransport {
     }
 
     fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        // 返回代理地址或伪造的本地地址
         Ok(self.proxy_addr)
     }
 }
@@ -304,9 +365,14 @@ impl HybridTransport {
 #[async_trait]
 impl PacketTransport for HybridTransport {
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
-        // 路由逻辑：检查是否为虚拟 IP (Class E: 240.x.x.x)
+        // 路由逻辑：检查是否为虚拟 IP (Class E: 240.0.0.0/4)
+        // 范围: 240.0.0.0 - 255.255.255.255
+        // 我们在 VirtualDnsMapper 中避开了 255.x.x.x
         let is_virtual = match target {
-            SocketAddr::V4(addr) => addr.ip().octets()[0] == VIRTUAL_IP_PREFIX,
+            SocketAddr::V4(addr) => {
+                let octets = addr.ip().octets();
+                octets[0] >= 240 // Class E Check
+            },
             _ => false,
         };
 
@@ -336,93 +402,18 @@ impl PacketTransport for HybridTransport {
 }
 
 // ============================================================================
-//  4. 虚拟 DNS 映射器 (辅助工具)
+//  4. 虚拟 DNS 映射器 (Class E Enhanced)
+//  使用 Knuth Multiplicative Hash 实现 240.0.0.0/4 全域映射
 // ============================================================================
 
-#[derive(Debug)]
-struct VirtualDnsMapper {
-    // Domain -> VirtualIP
-    forward: RwLock<HashMap<String, SocketAddr>>,
-    // VirtualIP -> (Domain, Port)
-    backward: RwLock<HashMap<SocketAddr, (String, u16)>>,
-    // IP分配计数器 (240.0.0.1 开始)
-    counter: AtomicU32,
-}
-
-impl VirtualDnsMapper {
-    fn new() -> Self {
-        Self {
-            forward: RwLock::new(HashMap::new()),
-            backward: RwLock::new(HashMap::new()),
-            counter: AtomicU32::new(1),
-        }
-    }
-
-    fn get_or_create_ip(&self, domain_port: &str) -> SocketAddr {
-        // Check cache
-        if let Some(addr) = self.forward.read().await.get(domain_port) {
-            return *addr;
-        }
-
-        let mut f_lock = self.forward.write().await;
-        // Double check
-        if let Some(addr) = f_lock.get(domain_port) {
-            return *addr;
-        }
-
-        // Allocate new IP
-        let id = self.counter.fetch_add(1, Ordering::Relaxed);
-        let b1 = (id >> 16) as u8;
-        let b2 = (id >> 8) as u8;
-        let b3 = id as u8;
-        
-        // Parse port from string, default 0 if not present
-        let parts: Vec<&str> = domain_port.split(':').collect();
-        let port = if parts.len() > 1 {
-            parts[parts.len()-1].parse().unwrap_or(0)
-        } else { 0 };
-        
-        let domain_only = if parts.len() > 1 {
-            parts[0..parts.len()-1].join(":")
-        } else {
-            domain_port.to_string()
-        };
-
-        let ip = Ipv4Addr::new(VIRTUAL_IP_PREFIX, b1, b2, b3);
-        let addr = SocketAddr::new(IpAddr::V4(ip), port);
-
-        f_lock.insert(domain_port.to_string(), addr);
-        self.backward.write().await.insert(addr, (domain_only, port));
-
-        debug!("VirtualDNS: Mapped {} -> {}", domain_port, addr);
-        addr
-    }
-
-    fn resolve_ip(&self, ip: &SocketAddr) -> Option<(String, u16)> {
-        // 这里使用了简单的 block_on 或 try_read，因为 resolve 通常在 transport 的 send 路径
-        // 注意：在 async 环境中尽量不要用 blocking_read。
-        // 但 RwLock 是 tokio 的，所以可以 await。
-        // 由于 PacketTransport::send_to 是 async 的，这是安全的。
-        // 不过我们这里偷懒用了 std::sync::RwLock 还是 Tokio?
-        // 上面定义是 tokio::sync::RwLock.
-        
-        // 由于这是内部辅助，我们假设这是在一个 async block 中被调用。
-        // 但这里并没有 async。修正：改为 blocking RwLock (parking_lot) 性能更好且无需 await。
-        // parking_lot 对于极短的读操作是安全的。
-        
-        // 修正：将上面的 tokio::sync::RwLock 改为 parking_lot::RwLock
-        // 从而避免 async infect。
-        None // Placeholder: see fix below
-    }
-}
-
-// 修正 VirtualDnsMapper 使用同步锁以简化调用
 mod internal_dns {
     use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::net::{SocketAddr, IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicU32, Ordering};
-    use super::VIRTUAL_IP_PREFIX;
+
+    // 黄金分割素数 (for 32-bit hash)
+    const KNUTH_GOLDEN_PRIME: u32 = 2654435761;
 
     #[derive(Debug)]
     pub struct VirtualDnsMapper {
@@ -441,12 +432,43 @@ mod internal_dns {
         }
 
         pub fn get_or_create_ip(&self, domain_port: &str) -> SocketAddr {
+            // 1. Check cache
             if let Some(addr) = self.forward.read().get(domain_port) {
                 return *addr;
             }
             let mut f_lock = self.forward.write();
-            let id = self.counter.fetch_add(1, Ordering::Relaxed);
+            // Double check inside write lock
+            if let Some(addr) = f_lock.get(domain_port) {
+                return *addr;
+            }
+
+            // 2. Allocate new ID and Hash it
+            let id_raw = self.counter.fetch_add(1, Ordering::Relaxed);
             
+            // Knuth Multiplicative Hash: 将顺序 ID 映射到离散的 u32 空间
+            // 这种双射保证了无碰撞且分布均匀
+            let hash = id_raw.wrapping_mul(KNUTH_GOLDEN_PRIME);
+
+            // 3. Map to Class E (240.0.0.0 - 254.255.255.255)
+            let b0_raw = (hash >> 24) as u8;
+            let b1 = (hash >> 16) as u8;
+            let b2 = (hash >> 8) as u8;
+            let b3 = hash as u8;
+
+            // 强制首字节高 4 位为 1111 (0xF0 -> 240)
+            // 0xF0 | (low 4 bits of b0)
+            let mut b0 = 0xF0 | (b0_raw & 0x0F);
+
+            // 规避 255.x.x.x (广播风暴/保留)
+            if b0 == 255 {
+                b0 = 254; 
+            }
+
+            // 规避 .0 和 .255 结尾 (网络/广播地址)
+            let final_b3 = if b3 == 0 { 1 } else if b3 == 255 { 254 } else { b3 };
+
+            let ip = Ipv4Addr::new(b0, b1, b2, final_b3);
+
             // Extract Port
             let parts: Vec<&str> = domain_port.split(':').collect();
             let port = if parts.len() > 1 {
@@ -457,11 +479,11 @@ mod internal_dns {
                 parts[..parts.len()-1].join(":")
             } else { domain_port.to_string() };
 
-            let ip = Ipv4Addr::new(VIRTUAL_IP_PREFIX, (id >> 16) as u8, (id >> 8) as u8, id as u8);
             let addr = SocketAddr::new(IpAddr::V4(ip), port);
 
             f_lock.insert(domain_port.to_string(), addr);
             self.backward.write().insert(addr, (host, port));
+            
             addr
         }
 
@@ -471,3 +493,11 @@ mod internal_dns {
     }
 }
 use internal_dns::VirtualDnsMapper;
+
+// --- Helper ---
+fn current_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
