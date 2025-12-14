@@ -5,6 +5,12 @@ edition = "2025"
 authors = ["ETP Core Team"]
 description = "Evolutionary Transport Protocol Core Library"
 
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+
 [features]
 default = ["full"]
 full = ["ffi", "extensions", "countermeasures", "vpn", "anonymity"]
@@ -12,9 +18,15 @@ ffi = []
 extensions = ["notify", "reqwest", "serde_yaml", "toml", "rust-ini", "serde-xml-rs", "url", "regex"]
 countermeasures = []
 vpn = ["tun"]
-anonymity = ["tokio-util", "sled"]
+anonymity = ["tokio-util"]
+xdp = ["aya", "aya-log", "etherparse", "nix"]
 
 [dependencies]
+libc = { version = "0.2", optional = false }
+
+# Persistence
+sled = { version = "0.34", optional = true }
+
 # Async Runtime
 tokio = { version = "1.0", features = ["full"] }
 async-trait = "0.1"
@@ -74,9 +86,6 @@ regex = { version = "1.9", optional = true }
 # 用于 Tor/I2P 的 SOCKS5 握手和 TCP 封包处理
 tokio-util = { version = "0.7", features = ["codec"], optional = true } 
 
-# --- Optional: Persistence ---
-sled = { version = "0.34", optional = true }
-
 # --- Platform Specific Dependencies ---
 
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -85,4 +94,12 @@ winapi = { version = "0.3", features = ["winnt", "shell32", "processthreadsapi",
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "ios", target_os = "android"))'.dependencies]
 tun = { version = "0.5", optional = true }
-libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# 确保只在 Linux 编译
+# --- XDP / eBPF Dependencies ---
+aya = { version = "0.11", optional = true }
+aya-log = { version = "0.1", optional = true }
+etherparse = { version = "0.13", optional = true }
+# nix 提供了更安全的 ioctl 和 socket 封装，比纯 libc 更适合生产环境
+nix = { version = "0.26", features = ["net", "socket", "ioctl", "fs"], optional = true }

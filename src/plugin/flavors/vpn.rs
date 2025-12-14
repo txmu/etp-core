@@ -173,6 +173,7 @@ impl VpnFlavor {
     ) -> VpnState {
         let mut tun_conf = Configuration::default();
         tun_conf
+            .queues(4) // 开启多队列，对应 CPU 核心数，默认为4
             .address(config.virtual_ip)
             .netmask(config.virtual_mask)
             .mtu(config.mtu)
