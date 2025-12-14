@@ -2,7 +2,7 @@
 
 [package]
 name = "etp-core"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2025"
 description = "Core implementation of the Evolutionary Transport Protocol (Full Stack)"
 
