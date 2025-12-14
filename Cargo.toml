@@ -1,17 +1,18 @@
 [package]
 name = "etp-core"
-version = "0.12.5"
+version = "1.0.0"
 edition = "2025"
 authors = ["ETP Core Team"]
 description = "Evolutionary Transport Protocol Core Library"
 
 [features]
 default = ["full"]
-full = ["ffi", "extensions", "countermeasures", "vpn"]
+full = ["ffi", "extensions", "countermeasures", "vpn", "anonymity"]
 ffi = []
 extensions = ["notify", "reqwest", "serde_yaml", "toml", "rust-ini", "serde-xml-rs", "url", "regex"]
 countermeasures = []
 vpn = ["tun"]
+anonymity = ["tokio-util", "sled"]
 
 [dependencies]
 # Async Runtime
@@ -68,6 +69,13 @@ rust-ini = { version = "0.20", optional = true }
 serde-xml-rs = { version = "0.6", optional = true }
 url = { version = "2.4", optional = true }
 regex = { version = "1.9", optional = true }
+
+# --- Optional: Anonymity Module ---
+# 用于 Tor/I2P 的 SOCKS5 握手和 TCP 封包处理
+tokio-util = { version = "0.7", features = ["codec"], optional = true } 
+
+# --- Optional: Persistence ---
+sled = { version = "0.34", optional = true }
 
 # --- Platform Specific Dependencies ---
 

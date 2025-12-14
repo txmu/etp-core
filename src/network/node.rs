@@ -533,56 +533,87 @@ impl EtpEngine {
         if config.recv_buffer_size == 0 { config.recv_buffer_size = DEFAULT_RECV_BUF; }
         if config.send_buffer_size == 0 { config.send_buffer_size = DEFAULT_SEND_BUF; }
         if config.mtu == 0 { config.mtu = DEFAULT_MTU; }
-
-        // Transport
-        let socket = UdpSocket::bind(&config.bind_addr).await?;
+        
+        // 初始化 UDP Transport
+        let socket = UdpSocket::bind(&config.bind_addr).await
+            .context(format!("Failed to bind UDP socket on {}", config.bind_addr))?;
+        
+        // 尝试设置缓冲区，忽略错误（某些 OS 可能不支持）
         let _ = socket.set_recv_buffer_size(config.recv_buffer_size);
         let _ = socket.set_send_buffer_size(config.send_buffer_size);
         let transport = Arc::new(UdpTransport(Arc::new(socket)));
         
         info!("ETP Kernel booted on {}. Mode: {:?}. Anonymity: {}", 
             config.bind_addr, config.multiplexing_mode, config.anonymity.enable_cover_traffic);
-
-        // --- Feature 1: Agent Integration (Autonomy) ---
+            
+            // 调用通用构造逻辑
+            Self::new_with_transport(config, plugins, transport).await
+    }
+    
+    /// 高级构造器：支持自定义传输层 (Tor/I2P/TCP/Memory)
+    /// 这是实现深度匿名模块的关键入口
+    pub async fn new_with_transport(
+        mut config: NodeConfig,
+        plugins: Arc<PluginRegistry>,
+        transport: Arc<dyn PacketTransport> // <--- 关键：依赖注入
+    ) -> Result<(Self, EtpHandle, mpsc::Receiver<(SocketAddr, Vec<u8>)>)> {
+    
+        // 1. 初始化核心组件
         let my_id = blake3::hash(&config.keypair.public).into();
+        
+        info!("ETP Kernel Booting... ID: {}", hex::encode(my_id));
+        info!("Profile: {:?} | Anonymity: CoverTraffic={}, Jitter={:?}", 
+            config.profile, 
+            config.anonymity.enable_cover_traffic,
+            config.anonymity.jitter_ms_range
+        );
+        
+        // 2. 启动智能体 (Autonomous Agents)
         let agents = plugins.get_agents();
         for agent in agents {
-            info!("Booting Autonomous Agent: {:?}", agent.capability_id());
+            info!("Booting Agent: {:?}", agent.capability_id());
             let context = AgentContext { node_id: my_id };
             let agent_clone = agent.clone();
             tokio::spawn(async move {
                 agent_clone.run(context).await;
             });
         }
-
-        // Shared State
+        
+        // 3. 构建共享状态
         let token_manager = Arc::new(TokenManager::new(config.stateless_secret));
         let routing_table = Arc::new(RoutingTable::new(my_id));
-        
-        let (app_tx, data_rx) = mpsc::channel(4096);
-        let (data_tx, app_rx) = mpsc::channel(4096);
-        let (cmd_tx, cmd_rx) = mpsc::channel(256);
-
+        let acl = Arc::new(AclManager::new(true)); // 默认开启严格 ACL 模式
         let nat_mgr = Arc::new(RwLock::new(NatManager::new()));
+        let sessions = Arc::new(DashMap::new());
+        let dht_store = Arc::new(DashMap::new());
+        let dht_pending = Arc::new(DashMap::new());
+        let metrics = Arc::new(NodeMetrics::default());
+        let banned_ips = Arc::new(DashMap::new());
         
+        // 4. 构建通信通道
+        let (app_tx, data_rx) = mpsc::channel(4096); // Outbound Data (App -> Net)
+        let (data_tx, app_rx) = mpsc::channel(4096); // Inbound Data (Net -> App)
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);   // Commands
+        
+        // 5. 组装上下文
         let ctx = ProcessingContext {
-            transport,
+            transport, // 使用传入的 Transport
             config: Arc::new(config),
             routing_table,
-            sessions: Arc::new(DashMap::new()),
+            sessions,
             nat_manager: nat_mgr,
-            acl: Arc::new(AclManager::new(true)),
+            acl,
             plugins,
-            data_tx: app_tx,
-            dht_pending_queries: Arc::new(DashMap::new()),
+            data_tx: data_tx, // 注意：这是给 Session 用的，将解密数据发给 App
+            dht_pending_queries: dht_pending,
             token_manager,
-            dht_store: Arc::new(DashMap::new()),
-            metrics: Arc::new(NodeMetrics::default()),
+            dht_store,
+            metrics,
             default_handler: None,
             fallback_handler: None,
-            banned_ips: Arc::new(DashMap::new()),
+            banned_ips,
         };
-
+        
         let handle = EtpHandle { data_tx: app_tx, cmd_tx };
         let engine = Self { ctx, data_rx, cmd_rx };
 
