@@ -1,6 +1,6 @@
 [package]
 name = "etp-core"
-version = "1.3.0"
+version = "1.3.1"
 edition = "2025"
 authors = ["ETP Core Team"]
 description = "Evolutionary Transport Protocol Core Library"
@@ -21,6 +21,7 @@ vpn = ["tun"]
 anonymity = ["tokio-util"]
 xdp = ["aya", "aya-log", "etherparse", "nix"]
 ens-gateway = ["ethers", "warp"]
+paranoid-security = ["zeroize"]
 
 [dependencies]
 libc = { version = "0.2", optional = false }
@@ -82,6 +83,11 @@ rust-ini = { version = "0.20", optional = true }
 serde-xml-rs = { version = "0.6", optional = true }
 url = { version = "2.4", optional = true }
 regex = { version = "1.9", optional = true }
+
+# zeroize仅在开启“偏执安全”特性时引入。注意，paranoid-security特性与SecurityProfile中的Turbo或Paranoid等无关
+# 普通模式 (default): 无额外开销，保持极速 O(1) 操作。这利用 Rust 的所有权和边界检查机制，在逻辑层面上防止旧数据被读取，从而省去了物理擦除数据的开销。
+# 偏执模式 (paranoid-security): 彻底物理擦除数据，增加 O(N) 的内存写操作。对于 10Gbps+ 的高吞吐场景会有可见的 CPU 占用提升，但在密钥协商和钱包签名等低频高敏场景下完全可忽略。好处是即使发生 Panic 导致 Core Dump，或者利用 unsafe 代码越界读取 Pool 中的缓存，攻击者也只能读到全 0 数据。
+zeroize = { version = "1.7", optional = true }
 
 # --- Optional: Anonymity Module ---
 # 用于 Tor/I2P 的 SOCKS5 握手和 TCP 封包处理
