@@ -8,6 +8,9 @@ pub mod control;
 // 不依赖 Sled 的 Flavor
 pub mod fileshare;
 
+pub mod bt_bridge;
+pub mod ipfs_fusion; 
+
 // 依赖sled的Flavors：
 
 // 1. Chat Flavor (依赖 Sled)
