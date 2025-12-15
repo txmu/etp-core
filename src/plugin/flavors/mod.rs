@@ -11,6 +11,8 @@ pub mod fileshare;
 pub mod bt_bridge;
 pub mod ipfs_fusion; 
 
+pub mod mailbox;
+
 // 依赖sled的Flavors：
 
 // 1. Chat Flavor (依赖 Sled)
@@ -30,3 +32,7 @@ pub mod tns;
 // 所以必须一同加上保护，或者重构 Gateway 代码。
 #[cfg(feature = "sled")]
 pub mod http_gateway;
+
+
+#[cfg(feature = "extensions")]
+pub mod signal_drop;
