@@ -14,7 +14,12 @@ pub mod ens;
 pub mod identity;
 pub mod kns;
 
-// 4. 传输层构建套件
+// 4. [新增] KNS-TNS 适配器
+// 只有当启用了持久化存储(Sled)时，TnsFlavor 才可用，该适配器才有意义
+#[cfg(feature = "persistence")]
+pub mod kns_adapter;
+
+// 5. 传输层构建套件
 pub mod transport_kit;
 
 // ============================================================================
@@ -75,8 +80,23 @@ pub use kns::{
     ExternalResolver,
 };
 
+// --- [新增] KNS Adapter ---
+#[cfg(feature = "persistence")]
+pub use kns_adapter::TnsBackedKnsResolver;
+
 // --- Transport Kit (自定义传输层构建器) ---
 pub use transport_kit::{
     // 核心构建器
     TransportKit,
-    TransportKitBuild
+    TransportKitBuilder,
+    // 接口
+    VirtualLink,
+    VirtualStream,
+    TransportLayer,
+    // 内置组件
+    TcpLink,
+    SimpleTcpLink,
+    XorLayer,
+    LogLayer,
+    AddressRegistry,
+};

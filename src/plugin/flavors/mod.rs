@@ -33,6 +33,9 @@ pub mod tns;
 #[cfg(feature = "sled")]
 pub mod http_gateway;
 
-
 #[cfg(feature = "extensions")]
 pub mod signal_drop;
+
+// [新增] 通用信使 Flavor (依赖 Sled)
+#[cfg(feature = "sled")]
+pub mod universal;

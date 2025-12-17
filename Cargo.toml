@@ -1,6 +1,6 @@
 [package]
 name = "etp-core"
-version = "1.5.1"
+version = "1.6.0"
 edition = "2025"
 authors = ["ETP Core Team"]
 description = "Evolutionary Transport Protocol Core Library"
@@ -27,6 +27,7 @@ persistence = ["sled"]
 dht_anti_sybil = []
 ipfs-integration = ["libp2p", "multihash"]
 smart-contracts = ["dep:ethers"]
+solana = ["dep:solana-sdk"]
 
 
 [dependencies]
@@ -101,9 +102,6 @@ pqcrypto-kyber = { version = "0.8", optional = true }
 pqcrypto-dilithium = { version = "0.5", optional = true }
 pqcrypto-traits = { version = "0.3", optional = true }
 
-# --- Smart Contract Support (Optional) ---
-ethers = { version = "2.0", optional = true }
-
 # zeroize仅在开启“偏执安全”特性时引入。注意，paranoid-security特性与SecurityProfile中的Turbo或Paranoid等无关
 # 普通模式 (default): 无额外开销，保持极速 O(1) 操作。这利用 Rust 的所有权和边界检查机制，在逻辑层面上防止旧数据被读取，从而省去了物理擦除数据的开销。
 # 偏执模式 (paranoid-security): 彻底物理擦除数据，增加 O(N) 的内存写操作。对于 10Gbps+ 的高吞吐场景会有可见的 CPU 占用提升，但在密钥协商和钱包签名等低频高敏场景下完全可忽略。好处是即使发生 Panic 导致 Core Dump，或者利用 unsafe 代码越界读取 Pool 中的缓存，攻击者也只能读到全 0 数据。
@@ -125,6 +123,13 @@ thiserror = "1.0" # 建议添加，用于简化错误定义。这里就不带上
 # 仅在开启 ipfs-integration 时引入
 libp2p = { version = "0.52", features = ["tcp", "dns", "noise", "yamux", "kad", "macros", "tokio"], optional = true }
 multihash = { version = "0.19", optional = true }
+
+# Solana (仅在开启 solana 特性时引入)
+solana-sdk = { version = "1.16", optional = true }
+
+# Bloom Filter (用于高效 Gossip 同步)
+# 生产级通常使用专门的库，这里为了减少依赖，我们将在 universal.rs 内部实现一个简单的，
+# 或者引入 bloomfilter crate。本库中我们手动实现了这个库，以减少依赖树。
 
 # --- Platform Specific Dependencies ---
 

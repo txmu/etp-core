@@ -1,28 +1,44 @@
+
 // etp-core/src/plugin/flavors/chat.rs
+
+#![cfg(feature = "sled")]
 
 use std::sync::Arc;
 use std::net::SocketAddr;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Serialize, Deserialize};
-use sled::{Db, Tree};
+use sled::{Db, IVec};
 use anyhow::{Result, anyhow, Context};
-use log::{info, error, debug, warn};
+use log::{info, error, debug, warn, trace};
 use chrono::Utc;
 use tokio::sync::{broadcast, mpsc};
 use x25519_dalek::{StaticSecret, PublicKey as XPublicKey};
 use ed25519_dalek::{SigningKey, VerifyingKey, Signer, Verifier, Signature};
 use blake3;
+use rand::Rng;
 
 use crate::plugin::{Flavor, FlavorContext, CapabilityProvider};
 use crate::crypto::onion::OnionCrypto;
 use crate::NodeID;
 use crate::common::DhtStoreRequest;
 
+// --- 条件编译引入模块 ---
+
+#[cfg(feature = "countermeasures")]
+use crate::countermeasures::entropy::EntropyReducer;
+
+#[cfg(feature = "anonymity")]
+use crate::anonymity::cover_traffic::CoverTrafficGenerator; // 假设存在此工具，或者我们在本文件实现简化版
+
+#[cfg(feature = "extensions")]
+use crate::extensions::identity::{EtpIdentity, IdentityManager};
+
 // --- 协议常量 ---
 const CHAT_PROTO_VER: u8 = 0x02;
 const CMD_MSG: u8 = 0x01;
 const CMD_SYNC: u8 = 0x02;
 const CMD_ACK: u8 = 0x03;
+const CMD_COVER_NOISE: u8 = 0xFF; // 新增：掩护流量指令
 
 const MAX_DIRECT_RETRIES: u32 = 3;
 const RETRY_INTERVAL_SECS: u64 = 10;
@@ -106,6 +122,7 @@ impl ChatStore {
     pub fn save_inbox(&self, msg: &ChatMessage) -> Result<()> {
         let tree = self.db.open_tree("inbox")?;
         // Key: Timestamp(BE) + MsgID (按时间排序)
+        // 使用 BigEndian 确保 Sled 的字节序排序符合时间顺序
         let mut key = Vec::with_capacity(24);
         key.extend_from_slice(&msg.timestamp.to_be_bytes());
         key.extend_from_slice(&msg.msg_id.to_be_bytes());
@@ -159,8 +176,6 @@ impl ChatStore {
 
     /// 获取目标为特定 ID 的所有消息 (用于 SYNC 响应)
     fn get_messages_for_target(&self, target_id: &NodeID) -> Vec<ChatMessage> {
-        // 全表扫描 Outbox 效率较低，生产级应建立二级索引 (TargetID -> [MsgID])
-        // 这里假设 Outbox 不会太大，直接遍历
         self.get_pending_messages().into_iter()
             .filter(|e| e.target_node_id == *target_id)
             .map(|e| e.msg)
@@ -174,12 +189,31 @@ impl ChatStore {
     
     /// 检查消息是否已存在 (去重)
     pub fn exists_in_inbox(&self, msg_id: u128) -> bool {
-        // Sled scan is slow, need secondary index: MsgID -> Key
-        // MVP Optimization: Just check if we processed it recently in memory or bloom filter.
-        // Or scan inbox: Requires optimized Key design.
-        // Current Key: Timestamp+MsgID. 
-        // We skip this check for now, trusting upper layer deduplication or accepting overwrites.
+        // MVP Optimization: 暂时不做全表扫描去重，依赖上层逻辑
         false 
+    }
+
+    // ========================================================================
+    //  [NEW] GUI Data API
+    // ========================================================================
+
+    /// 获取历史消息列表 (支持分页，按时间倒序)
+    /// 用于 GUI 客户端渲染界面
+    pub fn get_history(&self, limit: usize, offset: usize) -> Result<Vec<ChatMessage>> {
+        let tree = self.db.open_tree("inbox")?;
+        
+        // Sled 的迭代器是按 Key 排序的 (Timestamp 升序)。
+        // 为了显示最新消息，我们需要 rev() (Timestamp 降序)。
+        let iter = tree.iter().rev();
+        
+        let messages: Vec<ChatMessage> = iter
+            .skip(offset)
+            .take(limit)
+            .filter_map(|res| res.ok())
+            .filter_map(|(_, v)| bincode::deserialize::<ChatMessage>(&v).ok())
+            .collect();
+
+        Ok(messages)
     }
 }
 
@@ -200,6 +234,10 @@ pub struct ChatFlavor {
     dht_tx: mpsc::Sender<DhtStoreRequest>,
     /// 网络发送通道 (用于主动发包，如 Retry 或 Sync)
     network_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+
+    // --- 新特性状态 ---
+    #[cfg(feature = "anonymity")]
+    last_real_traffic: parking_lot::Mutex<std::time::Instant>,
 }
 
 impl ChatFlavor {
@@ -225,7 +263,14 @@ impl ChatFlavor {
             ui_tx,
             dht_tx,
             network_tx,
+            #[cfg(feature = "anonymity")]
+            last_real_traffic: parking_lot::Mutex::new(std::time::Instant::now()),
         }))
+    }
+
+    /// [NEW] 公开 API: 获取历史记录
+    pub fn get_history(&self, limit: usize, offset: usize) -> Result<Vec<ChatMessage>> {
+        self.store.get_history(limit, offset)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ChatMessage> {
@@ -235,7 +280,19 @@ impl ChatFlavor {
     /// 生成 E2EE 加密包
     /// Payload: [Ver][CMD][EphemeralPub][Ciphertext]
     fn pack_message(&self, msg: &ChatMessage, receiver_enc_pub: [u8; 32]) -> Result<Vec<u8>> {
-        let plain_bytes = bincode::serialize(msg)?;
+        let mut plain_bytes = bincode::serialize(msg)?;
+
+        // [Feature] Countermeasures: 熵减 (Entropy Reduction)
+        // 在 Onion 加密之前，先对 Plaintext 做熵减处理（例如 Base64 或加盐混淆），
+        // 这样即使外层被破解，内部看起来也像是一段文本而不是二进制。
+        // *注意*：虽然 Onion 会再次加密，但这一步是为了对抗深度的载荷分析。
+        #[cfg(feature = "countermeasures")]
+        {
+            // 使用 EntropyReducer 降低特征 (mode=true 表示使用自定义字符集)
+            // 注意：这里我们覆盖了 plain_bytes
+            plain_bytes = EntropyReducer::reduce(&plain_bytes, true);
+        }
+
         let (ephemeral_pub, ciphertext) = OnionCrypto::seal(&receiver_enc_pub, &plain_bytes)
             .context("Encryption failed")?;
         
@@ -248,9 +305,6 @@ impl ChatFlavor {
     }
 
     /// 用户接口：发送消息
-    /// 1. 签名并构建 Message
-    /// 2. 存入 Outbox
-    /// 3. 返回加密后的 Payload (供 Node 立即发送)
     pub fn send_message(&self, content: &str, target_id: NodeID, target_enc_pub: [u8; 32]) -> Result<Vec<u8>> {
         let msg_id = rand::random::<u128>();
         let timestamp = Utc::now().timestamp();
@@ -284,12 +338,17 @@ impl ChatFlavor {
         };
         self.store.save_outbox(&entry)?;
 
+        // 更新活跃时间 (Anonymity)
+        #[cfg(feature = "anonymity")]
+        {
+            *self.last_real_traffic.lock() = std::time::Instant::now();
+        }
+
         // 打包
         self.pack_message(&msg, target_enc_pub)
     }
 
     /// 发送 ACK
-    /// Payload: [Ver][CMD_ACK][MsgID(16)]
     async fn send_ack(&self, target_addr: SocketAddr, msg_id: u128) {
         let mut payload = Vec::new();
         payload.push(CHAT_PROTO_VER);
@@ -300,7 +359,6 @@ impl ChatFlavor {
     }
 
     /// 发送 SYNC 请求
-    /// Payload: [Ver][CMD_SYNC][MyNodeID]
     async fn send_sync(&self, target_addr: SocketAddr) {
         let my_id = blake3::hash(self.verifying_key.as_bytes()).into();
         let mut payload = Vec::new();
@@ -331,6 +389,16 @@ impl ChatFlavor {
         self.store.update_outbox_entry(entry)?;
         Ok(())
     }
+
+    /// [Feature] Extensions: 验证身份
+    #[cfg(feature = "extensions")]
+    fn verify_identity_extension(&self, msg: &ChatMessage) -> Result<()> {
+        // 如果 Extensions 模块启用，我们可以通过 IdentityManager 进行更复杂的验证
+        // 例如：检查该 PubKey 是否在本地的 Trust Anchor 中，或者是否符合特定的 Policy
+        // 这里仅作演示：打印日志
+        trace!("Extensions: Verifying identity for msg {}", msg.msg_id);
+        Ok(())
+    }
 }
 
 impl CapabilityProvider for ChatFlavor {
@@ -341,8 +409,13 @@ impl Flavor for ChatFlavor {
     fn priority(&self) -> u8 { 150 }
 
     fn on_stream_data(&self, ctx: FlavorContext, data: &[u8]) -> bool {
-        if data.len() < 2 { return false; }
-        if data[0] != CHAT_PROTO_VER { return false; }
+        if data.len() < 2 || data[0] != CHAT_PROTO_VER { return false; }
+
+        // 更新接收活跃状态
+        #[cfg(feature = "anonymity")]
+        {
+            *self.last_real_traffic.lock() = std::time::Instant::now();
+        }
 
         match data[1] {
             CMD_MSG => {
@@ -354,17 +427,41 @@ impl Flavor for ChatFlavor {
                 
                 // 尝试解密
                 let my_priv = self.decryption_key.to_bytes();
-                let plaintext = match OnionCrypto::open(eph_pub, ciphertext, &my_priv) {
+                
+                // Onion Open
+                let mut plaintext = match OnionCrypto::open(eph_pub, ciphertext, &my_priv) {
                     Ok(pt) => pt,
                     Err(e) => {
                         debug!("Chat: Decrypt fail: {}", e);
-                        return false; // Not for me?
+                        return false; 
                     }
                 };
+
+                // [Feature] Countermeasures: 熵还原
+                #[cfg(feature = "countermeasures")]
+                {
+                    match EntropyReducer::restore(&plaintext, true) {
+                        Ok(original) => plaintext = original,
+                        Err(e) => {
+                            warn!("Chat: Entropy restoration failed: {}", e);
+                            return true; // 数据损坏
+                        }
+                    }
+                }
 
                 if let Ok(msg) = bincode::deserialize::<ChatMessage>(&plaintext) {
                     // 验签
                     if msg.verify().is_ok() {
+                        
+                        // [Feature] Extensions: 额外身份检查
+                        #[cfg(feature = "extensions")]
+                        {
+                            if let Err(e) = self.verify_identity_extension(&msg) {
+                                warn!("Chat: Identity extension check failed: {}", e);
+                                // 根据策略，可能拒绝处理
+                            }
+                        }
+
                         info!("Chat: Received Msg from {:?}", hex::encode(msg.sender_pub_key));
                         
                         // 去重与存储
@@ -412,20 +509,17 @@ impl Flavor for ChatFlavor {
                 let pending = self.store.get_messages_for_target(&node_id);
                 if !pending.is_empty() {
                     info!("Chat: Syncing {} messages to {}", pending.len(), ctx.src_addr);
-                    let net_tx = self.network_tx.clone();
-                    let addr = ctx.src_addr;
-                    // 由于我们需要对方公钥来加密，而 OutboxEntry 里存了 target_enc_pub
-                    // 但 get_messages_for_target 只返回 ChatMessage。
-                    // 修正：我们直接遍历 OutboxEntry 吧
-                    let entries = self.store.get_pending_messages();
-                    let me = self.verifying_key.to_bytes(); // Actually need struct copy logic
-                    
-                    // 这里为了简化，假设我们能重新打包
-                    // 由于 self 在 async 块中被借用问题，我们克隆必要数据
-                    // 实际上需要更精细的逻辑
+                    // 逻辑省略：重新加密并发送 (需要对方 EncKey，通常 OutboxEntry 里有)
                 }
                 true
             },
+            CMD_COVER_NOISE => {
+                // [Feature] Anonymity: 收到掩护流量
+                // 静默丢弃，不做任何处理。
+                // 仅仅它的到达本身就已经起到了混淆流量模式的作用。
+                trace!("Chat: Received cover traffic noise.");
+                true
+            }
             _ => false,
         }
     }
@@ -447,11 +541,38 @@ impl Flavor for ChatFlavor {
     fn on_connection_close(&self, _peer: SocketAddr) {}
 
     /// 后台轮询 (由 Node Tick 驱动)
-    /// 检查超时消息并重试/降级
     fn poll(&self) {
-        let pending = self.store.get_pending_messages();
         let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
 
+        // 1. [Feature] Anonymity: 生成掩护流量 (Cover Traffic)
+        #[cfg(feature = "anonymity")]
+        {
+            let last_active = *self.last_real_traffic.lock();
+            // 如果过去 5 秒没有真实流量，且随机概率触发
+            if last_active.elapsed() > Duration::from_secs(5) {
+                let mut rng = rand::thread_rng();
+                if rng.gen_bool(0.1) { // 10% 概率触发
+                    trace!("Chat: Generating cover noise...");
+                    let noise_len = rng.gen_range(100..1024);
+                    let mut noise = vec![0u8; noise_len];
+                    rng.fill(&mut noise[..]);
+                    
+                    let mut payload = Vec::with_capacity(2 + noise_len);
+                    payload.push(CHAT_PROTO_VER);
+                    payload.push(CMD_COVER_NOISE);
+                    payload.extend(noise);
+
+                    // 发送给随机 Peer? 
+                    // Flavor 无法直接遍历所有 Peers。
+                    // 这是一个架构限制。通常 Cover Traffic 由 Engine 处理。
+                    // 但 Flavor 可以向已知的特定地址（如 Gateway）发送应用层噪声。
+                    // 这里仅作逻辑展示。
+                }
+            }
+        }
+
+        // 2. 消息重试逻辑
+        let pending = self.store.get_pending_messages();
         for mut entry in pending {
             // 如果已经在 DHT 状态，跳过
             if entry.status != MsgStatus::Pending { continue; }
@@ -467,34 +588,16 @@ impl Flavor for ChatFlavor {
                     let dht_tx = self.dht_tx.clone();
                     let store = self.store.clone();
                     
-                    // 需要 Clone Self 或者把逻辑拆分。因为 poll 是 &self。
-                    // 这里的 hack 是通过 spawn move 来规避生命周期
-                    // 但这需要 self 满足 'static。 Arc<Self> 满足。
-                    // 但是 trait method 是 &self，无法 move Arc。
-                    // 解决方案：使用内部字段的 clone。
-                    
-                    // 临时构造 Payload (这里有点重复代码，生产应封装)
-                    // 注意：这里无法调用 self.pack_message 因为 &self 借用问题? 
-                    // 不，pack_message 只是 &self，没问题。
-                    
-                    // 关键问题是 trigger_dht_fallback 是 async 的，poll 是 sync 的。
-                    // 所以必须 spawn。
-                    
-                    // 我们在 struct 内部无法直接 spawn async calling self method easily without Arc wrapping self.
-                    // 但 Flavor 是通过 Arc<dyn Flavor> 调用的。
-                    // Rust 限制：&self 无法变成 Arc<Self> unless we use a wrapper.
-                    
-                    // 简便方法：手动在 spawn 块里重做 pack_message 的逻辑 (纯计算)，然后 send channel
-                    // 或者将 pack_message 变为关联函数 (static method)
-                    
-                    // 这里演示手动处理：
+                    // 重新打包 (需要处理可能的 feature 加密逻辑)
                     let payload_res = self.pack_message(&entry.msg, entry.target_enc_pub);
+                    
                     if let Ok(payload) = payload_res {
                         let req = DhtStoreRequest {
                             key: entry.target_node_id,
                             value: payload,
                             ttl_seconds: MSG_TTL_SECS as u32,
                         };
+                        
                         let dht_ch = self.dht_tx.clone();
                         tokio::spawn(async move {
                             let _ = dht_ch.send(req).await;
@@ -503,26 +606,9 @@ impl Flavor for ChatFlavor {
                         // Update status sync
                         entry.status = MsgStatus::SentToDHT;
                         let _ = self.store.update_outbox_entry(&entry);
+                    } else {
+                        error!("Chat: Failed to pack message for DHT fallback");
                     }
-                } else {
-                    // 尝试重发 (Direct)
-                    // 问题：我们不知道对方现在的 IP (SocketAddr)。
-                    // Node 层的 RoutingTable 知道。
-                    // Flavor 无法直接访问 RoutingTable。
-                    // 这是一个架构限制。Flavor 通常只能响应 on_stream_data。
-                    // 如果要主动重发，我们需要一种机制告诉 Node "请发给这个 NodeID"。
-                    // 目前 network_tx 接受 SocketAddr。
-                    
-                    // 解决方案：
-                    // 1. Chat Flavor 不负责重试物理发送，只负责逻辑重试 (DHT)。
-                    // 2. 或者引入 lookup callback。
-                    
-                    // 鉴于架构，我们决定：
-                    // Chat Flavor 仅在 on_connection_open 时触发 Sync。
-                    // Poll 仅用于检测超时并降级到 DHT。
-                    // 如果连接断开，Direct Retry 是没有意义的 (不知发给谁)。
-                    // 如果连接连着，Sync 应该已经处理了。
-                    // 所以：Poll 主要负责 Fallback to DHT。
                 }
             }
         }
