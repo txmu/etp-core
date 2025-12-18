@@ -422,3 +422,14 @@ impl CongestionControlAlgo for FfiCongestion {
 //    *   解决方案: 编写一个极小的 C 或 Go 编写的 CLI Wrapper (etp-cli)。
 //    *   `etp-cli` 接收命令行参数作为配置，将标准输入 (Stdin) 作为数据源发送 (`etp_send`)，将接收到的数据 (`flavor_on_stream_data`) 打印到标准输出 (Stdout)。
 //    *   这样 Shell 就可以通过管道操作： `cat data.bin | etp-cli --target 1.2.3.4 | processed_output_tool`。
+
+// 另外，以下还提供了对Python, Node.js与Go都额外支持：
+
+#[cfg(feature = "binding-python")]
+pub mod python_bindings;
+
+#[cfg(feature = "binding-node")]
+pub mod node_bindings;
+
+#[cfg(feature = "binding-go")]
+pub mod go_bindings;

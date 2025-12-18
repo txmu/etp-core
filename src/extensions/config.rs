@@ -18,6 +18,7 @@ use reqwest::blocking::Client;
 use url::Url;
 use ed25519_dalek::{VerifyingKey, Signature, Verifier};
 use regex::Regex;
+use std::sync::OnceLock;
 
 // ============================================================================
 //  1. 基础定义与结构
@@ -329,9 +330,8 @@ impl DynamicConfig {
     }
 
     fn resolve_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
-        if path.is_empty() { return Some(root); }
-        let mut current = root;
-        let re = Regex::new(r"^([^\[]+)(?:\[(\d+)\])?$").ok()?;
+        static RE: OnceLock<regex::Regex> = OnceLock::new();
+        let re = RE.get_or_init(|| regex::Regex::new(r"^([^\[]+)(?:\[(\d+)\])?$").unwrap());
         
         for part in path.split('.') {
             if let Some(caps) = re.captures(part) {

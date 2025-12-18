@@ -19,6 +19,9 @@ use chacha20poly1305::{ChaCha20Poly1305, KeyInit, AeadInPlace};
 use blake3;
 use serde::{Serialize, Deserialize};
 
+use crate::error::EtpError;
+use crate::plugin::flavors::control::ControlCategory;
+
 // --- ETP Core Module Imports ---
 
 use crate::crypto::noise::{KeyPair, NoiseSession};
@@ -430,50 +433,79 @@ pub struct EtpHandle {
 }
 
 impl EtpHandle {
-    pub async fn send_data(&self, target: SocketAddr, data: Vec<u8>) -> Result<()> {
-        self.data_tx.send((target, data)).await.map_err(|_| anyhow!("Node stopped"))
+    /// 发送应用层数据（默认流）
+    pub async fn send_data(&self, target: SocketAddr, data: Vec<u8>) -> Result<(), EtpError> {
+        self.data_tx.send((target, data)).await
+            .map_err(|_| EtpError::Internal("Engine channel closed (Node stopped)".into()))
     }
     
-    pub async fn send_stream(&self, target: SocketAddr, id: u32, data: Vec<u8>) -> Result<()> {
-        self.cmd_tx.send(Command::SendStream { target, stream_id: id, data }).await.map_err(|_| anyhow!("Node stopped"))
+    /// 发送指定流数据（多路复用）
+    pub async fn send_stream(&self, target: SocketAddr, id: u32, data: Vec<u8>) -> Result<(), EtpError> {
+        self.cmd_tx.send(Command::SendStream { target, stream_id: id, data }).await
+            .map_err(|_| EtpError::Internal("Engine channel closed".into()))
     }
 
     /// 发送控制指令 (SideChannel)
-    pub async fn send_control_cmd(&self, target: SocketAddr, category: ControlCategory, data: Vec<u8>) -> Result<()> {
+    /// 包含载荷大小预检查
+    pub async fn send_control_cmd(&self, target: SocketAddr, category: ControlCategory, data: Vec<u8>) -> Result<(), EtpError> {
         if data.len() > MAX_SIDE_CHANNEL_PAYLOAD {
-            return Err(anyhow!("Control command too large (limit 1MB)"));
+            return Err(EtpError::PayloadTooLarge(data.len(), MAX_SIDE_CHANNEL_PAYLOAD));
         }
-        self.cmd_tx.send(Command::SendControl { target, category, data }).await.map_err(|_| anyhow!("Node stopped"))
+        self.cmd_tx.send(Command::SendControl { target, category, data }).await
+            .map_err(|_| EtpError::Internal("Engine channel closed".into()))
     }
     
-    pub async fn connect(&self, target: SocketAddr, remote_pub: Vec<u8>) -> Result<()> {
-        self.cmd_tx.send(Command::Connect { target, remote_pub }).await.map_err(|_| anyhow!("Node stopped"))
+    /// 主动发起连接
+    pub async fn connect(&self, target: SocketAddr, remote_pub: Vec<u8>) -> Result<(), EtpError> {
+        self.cmd_tx.send(Command::Connect { target, remote_pub }).await
+            .map_err(|_| EtpError::Internal("Engine channel closed".into()))
     }
 
-    pub async fn send_onion(&self, path: Vec<(SocketAddr, Vec<u8>)>, data: Vec<u8>) -> Result<()> {
-        self.cmd_tx.send(Command::SendOnion { path, data }).await.map_err(|_| anyhow!("Node stopped"))
+    /// 发送洋葱路由包
+    pub async fn send_onion(&self, path: Vec<(SocketAddr, Vec<u8>)>, data: Vec<u8>) -> Result<(), EtpError> {
+        self.cmd_tx.send(Command::SendOnion { path, data }).await
+            .map_err(|_| EtpError::Internal("Engine channel closed".into()))
     }
 
-    pub async fn dht_find_node(&self, target_id: NodeID) -> Result<Vec<NodeInfo>> {
+    /// 执行 DHT 节点查找
+    /// 返回明确的 Timeout 错误
+    pub async fn dht_find_node(&self, target_id: NodeID) -> Result<Vec<NodeInfo>, EtpError> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(Command::DhtFindNode { target_id, reply: tx }).await.map_err(|_| anyhow!("Node stopped"))?;
-        rx.await.map_err(|_| anyhow!("DHT Query dropped"))?
+        
+        // 1. 发送请求给 Engine
+        self.cmd_tx.send(Command::DhtFindNode { target_id, reply: tx }).await
+            .map_err(|_| EtpError::Internal("Engine stopped before sending command".into()))?;
+            
+        // 2. 等待回包 (处理超时)
+        // 注意：这里的 rx.await 错误通常意味着 sender 被 drop 了（即 Engine 处理过程中崩溃或忽略了请求）
+        let internal_result = rx.await.map_err(|_| EtpError::Timeout)?;
+        
+        // 3. 处理业务逻辑错误 (anyhow -> EtpError::Internal)
+        internal_result.map_err(|e| EtpError::Internal(format!("DHT Lookup failed: {}", e)))
     }
     
-    pub async fn dht_store(&self, key: NodeID, value: Vec<u8>, ttl: u32) -> Result<()> {
-        self.cmd_tx.send(Command::DhtStore { key, value, ttl }).await.map_err(|_| anyhow!("Node stopped"))
+    /// DHT 存储数据
+    pub async fn dht_store(&self, key: NodeID, value: Vec<u8>, ttl: u32) -> Result<(), EtpError> {
+        self.cmd_tx.send(Command::DhtStore { key, value, ttl }).await
+            .map_err(|_| EtpError::Internal("Engine channel closed".into()))
     }
 
-    pub async fn get_stats(&self) -> Result<String> {
+    /// 获取节点统计信息
+    pub async fn get_stats(&self) -> Result<String, EtpError> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(Command::GetStats { reply: tx }).await.map_err(|_| anyhow!("Node stopped"))?;
-        rx.await.map_err(|_| anyhow!("Stats dropped"))
+        self.cmd_tx.send(Command::GetStats { reply: tx }).await
+            .map_err(|_| EtpError::Internal("Engine stopped".into()))?;
+            
+        rx.await.map_err(|_| EtpError::Timeout)
     }
 
-    pub async fn shutdown(&self) -> Result<()> {
-        self.cmd_tx.send(Command::Shutdown).await.map_err(|_| anyhow!("Node stopped"))
+    /// 优雅停机
+    pub async fn shutdown(&self) -> Result<(), EtpError> {
+        self.cmd_tx.send(Command::Shutdown).await
+            .map_err(|_| EtpError::Internal("Engine already stopped".into()))
     }
 }
+
 
 // ============================================================================
 //  5. Engine Implementation

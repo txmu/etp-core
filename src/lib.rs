@@ -8,6 +8,9 @@ pub mod network;
 pub mod plugin;
 pub mod platform;
 
+pub mod error;
+pub use error::EtpError;
+
 // 类型别名
 pub type NodeID = [u8; 32];
 pub type SessionID = u32;

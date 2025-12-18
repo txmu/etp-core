@@ -22,6 +22,14 @@ pub mod kns_adapter;
 // 5. 传输层构建套件
 pub mod transport_kit;
 
+// 6. 其它扩展内容
+pub mod pool_memory;
+pub mod huoban;
+
+// [New] TC-15 Virtual Machine & Smart Contract Engine
+#[cfg(feature = "tc15-tcc")]
+pub mod tc15_tcc;
+
 // ============================================================================
 //  统一导出 (Re-exports)
 // ============================================================================
@@ -80,9 +88,12 @@ pub use kns::{
     ExternalResolver,
 };
 
-// --- [新增] KNS Adapter ---
+// --- KNS Adapter ---
 #[cfg(feature = "persistence")]
 pub use kns_adapter::TnsBackedKnsResolver;
+
+// --- UFS Adapter ---
+pub use ufs_adapter::{UltraFileServerFlavor, FileMetadata, DirectoryListing};
 
 // --- Transport Kit (自定义传输层构建器) ---
 pub use transport_kit::{
@@ -100,3 +111,10 @@ pub use transport_kit::{
     LogLayer,
     AddressRegistry,
 };
+
+
+pub use pool_memory::{SharedMemoryPool, get_global_pool};
+pub use huoban::{HuoBanBoard, User as HuobanUser};
+
+#[cfg(feature = "tc15-tcc")]
+pub use tc15_tcc::{Tc15Flavor, Tc15Cpu}; // TccCompiler is internal helper
