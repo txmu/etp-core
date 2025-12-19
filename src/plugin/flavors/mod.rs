@@ -39,3 +39,8 @@ pub mod signal_drop;
 // [新增] 通用信使 Flavor (依赖 Sled)
 #[cfg(feature = "sled")]
 pub mod universal;
+
+// 新增的 DSL 执行器 Flavor
+// 注意：它依赖 dsl-runtime 和 bincode (etp core default)
+#[cfg(feature = "dsl-runtime")]
+pub mod dsl_executor;

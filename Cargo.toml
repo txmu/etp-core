@@ -1,9 +1,80 @@
 [package]
 name = "etp-core"
-version = "2.0.0"
-edition = "2025"
+version = "2.1.1"
+edition = "2021"
 authors = ["ETP Core Team"]
 description = "Evolutionary Transport Protocol Core Library"
+
+[lib]
+crate-type = ["cdylib", "rlib"] # cdylib 用于生成 .so/.dll 给 FFI 使用
+
+[features]
+default = ["full"]
+full = ["ffi", "extensions", "countermeasures", "vpn", "anonymity", "persistence", "dht_anti_sybil"]
+
+# --- 核心模块 ---
+ffi = []
+extensions = ["notify", "reqwest", "serde_yaml", "toml", "rust-ini", "serde-xml-rs", "url", "regex", "dep:flate2"]
+countermeasures = []
+vpn = ["tun"]
+anonymity = ["tokio-util"]
+persistence = ["sled"]
+dht_anti_sybil = []
+
+# --- 高级特性 ---
+xdp = ["aya", "aya-log", "etherparse", "nix"]
+ens-gateway = ["ethers", "warp"]
+quantum-encryption = ["dep:pqcrypto-kyber", "dep:pqcrypto-dilithium", "dep:pqcrypto-traits"]
+paranoid-security = ["zeroize", "quantum-encryption"]
+ipfs-integration = ["libp2p", "multihash"]
+smart-contracts = ["dep:ethers"]
+solana = ["dep:solana-sdk"]
+ultrafileserver = []
+safefs = ["dep:argon2", "dep:memmap2", "dep:users", "dep:nix"]
+tc15-tcc = [] # 开启 TC-15 虚拟机与 TCC 编译器扩展
+dsl-runtime = ["dep:serde", "dep:serde_json", "dep:nom"]
+
+# --- 语言绑定支持 (Super Support Features) ---
+# 开启对应的 feature 会引入特定语言的胶水库
+binding-python = ["dep:pyo3", "dep:pyo3-asyncio"]
+binding-node = ["dep:napi", "dep:napi-derive"]
+binding-go = [] # Go 使用 C ABI，无需额外 crate
+binding-java = ["dep:jni", "dep:lazy_static"]     # Java/Kotlin JNI 支持
+binding-erlang = ["dep:rustler", "dep:lazy_static"] # Erlang/Elixir NIF 支持
+binding-scheme = ["dep:libc", "dep:lazy_static"]    # Scheme C-FFI 支持
+# Lisp 家族支持
+# binding-lisp: 基础 C ABI 支持 (Common Lisp, Racket, Guile 等)
+binding-lisp = ["dep:libc", "dep:lazy_static"]
+# binding-elisp: Emacs 专用模块支持 (开启后生成的 .so 可被 Emacs 直接 require)
+binding-elisp = ["binding-lisp", "dep:emacs"]
+binding-lua = ["dep:mlua", "dep:lazy_static"]
+binding-shell = ["dep:serde", "dep:serde_json", "dep:lazy_static"]
+binding-powershell = ["dep:libc", "dep:lazy_static"]
+binding-ruby = ["dep:magnus", "dep:lazy_static"]
+binding-perl = ["dep:libc", "dep:lazy_static"]
+binding-zig = ["dep:libc", "dep:lazy_static"]
+
+# Vim 生态支持
+# 依赖 libc 进行指针操作，serde 处理 Vimscript 的 JSON 通信
+binding-vim = ["dep:libc", "dep:serde", "dep:serde_json", "dep:lazy_static"]
+
+# 注意：对于 Neovim，我们建议同时开启 binding-lua 以获得 mlua 支持，
+# 但为了独立性，这里使用纯 C ABI (LuaJIT FFI) 方式，这是 Neovim 社区更推荐的高性能做法。
+
+# 主开关：开启实验性语言支持
+binding-experimental = []
+
+# 子开关：分别开启特定语言支持（依赖 binding-experimental）
+# Nushell 需要 serde 处理复杂的 JSON-RPC 协议
+binding-nushell = ["binding-experimental", "dep:serde", "dep:serde_json"]
+# Ring 需要 libc 处理 VM 指针
+binding-ring = ["binding-experimental", "dep:libc"]
+# Haxe 需要 libc
+binding-haxe = ["binding-experimental", "dep:libc"]
+# Fusion 需要 libc
+binding-fusion = ["binding-experimental", "dep:libc"]
+# Carbon 需要 libc
+binding-carbon = ["binding-experimental", "dep:libc"]
 
 [profile.release]
 lto = true
@@ -11,33 +82,11 @@ codegen-units = 1
 panic = "abort"
 opt-level = 3
 
-[features]
-default = ["full"]
-full = ["ffi", "extensions", "countermeasures", "vpn", "anonymity", "persistence", "dht_anti_sybil"]
-ffi = []
-extensions = ["notify", "reqwest", "serde_yaml", "toml", "rust-ini", "serde-xml-rs", "url", "regex", "dep:flate2"]
-countermeasures = []
-vpn = ["tun"]
-anonymity = ["tokio-util"]
-xdp = ["aya", "aya-log", "etherparse", "nix"]
-ens-gateway = ["ethers", "warp"]
-quantum-encryption = ["dep:pqcrypto-kyber", "dep:pqcrypto-dilithium", "dep:pqcrypto-traits"]
-paranoid-security = ["zeroize", "quantum-encryption"]
-persistence = ["sled"]
-dht_anti_sybil = []
-ipfs-integration = ["libp2p", "multihash"]
-smart-contracts = ["dep:ethers"]
-solana = ["dep:solana-sdk"]
-binding-python = ["dep:pyo3", "dep:pyo3-asyncio"]
-binding-node = ["dep:napi", "dep:napi-derive"]
-binding-go = [] # Go 主要依赖 libc 和 unsafe 优化，不需要额外大库，但用 feature 区分逻辑
-ultrafileserver = []
-safefs = ["dep:argon2", "dep:memmap2", "dep:users", "dep:nix"]
-# 开启 TC-15 虚拟机与 TCC 编译器扩展
-tc15-tcc = []
-
 [dependencies]
+
 libc = { version = "0.2", optional = false }
+lazy_static = { version = "1.4", optional = true } # FFI 全局状态必需
+nom = { version = "7.1", optional = true } # 强大的解析器组合库
 
 # Persistence
 sled = { version = "0.34", optional = true }
@@ -135,13 +184,26 @@ solana-sdk = { version = "1.16", optional = true }
 # 生产级通常使用专门的库，这里为了减少依赖，我们将在 universal.rs 内部实现一个简单的，
 # 或者引入 bloomfilter crate。本库中我们手动实现了这个库，以减少依赖树。
 
-# --- Python Bindings ---
+# --- 语言绑定专用依赖 ---
+# Python
 pyo3 = { version = "0.20", features = ["extension-module", "abi3-py37"], optional = true }
 pyo3-asyncio = { version = "0.20", features = ["tokio-runtime"], optional = true }
 
-# --- Node.js Bindings ---
+# Node.js
 napi = { version = "2.14", default-features = false, features = ["napi4", "tokio_rt", "async"], optional = true }
 napi-derive = { version = "2.14", optional = true }
+
+# Java (JNI)
+jni = { version = "0.21", optional = true }
+
+# Erlang (NIF)
+rustler = { version = "0.30", optional = true }
+
+# Emacs 动态模块绑定库 (Rust 生态的神器)
+emacs = { version = "0.18", optional = true }
+
+# Lua 绑定 (支持 Lua 5.x, LuaJIT)
+mlua = { version = "0.9", features = ["lua54", "vendored", "async"], optional = true }
 
 # Go 绑定通常不需要额外 crate，但在 FFI 边界处理 panic 是好习惯
 # 我们沿用已有的 libc 和 log

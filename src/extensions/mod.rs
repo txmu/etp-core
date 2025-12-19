@@ -30,6 +30,10 @@ pub mod huoban;
 #[cfg(feature = "tc15-tcc")]
 pub mod tc15_tcc;
 
+// 新增 DSL 运行时模块
+#[cfg(feature = "dsl-runtime")]
+pub mod dsl;
+
 // ============================================================================
 //  统一导出 (Re-exports)
 // ============================================================================
@@ -118,3 +122,7 @@ pub use huoban::{HuoBanBoard, User as HuobanUser};
 
 #[cfg(feature = "tc15-tcc")]
 pub use tc15_tcc::{Tc15Flavor, Tc15Cpu}; // TccCompiler is internal helper
+
+// 新增 DSL 运行时模块
+#[cfg(feature = "dsl-runtime")]
+pub mod dsl;
