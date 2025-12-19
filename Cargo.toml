@@ -186,8 +186,8 @@ solana-sdk = { version = "1.16", optional = true }
 
 # --- 语言绑定专用依赖 ---
 # Python
-pyo3 = { version = "0.20", features = ["extension-module", "abi3-py37"], optional = true }
-pyo3-asyncio = { version = "0.20", features = ["tokio-runtime"], optional = true }
+pyo3 = { version = "0.21", features = ["extension-module", "abi3-py37"], optional = true }
+pyo3-asyncio = { version = "0.21", features = ["tokio-runtime"], optional = true }
 
 # Node.js
 napi = { version = "2.14", default-features = false, features = ["napi4", "tokio_rt", "async"], optional = true }
