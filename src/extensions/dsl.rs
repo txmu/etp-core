@@ -31,22 +31,45 @@ pub enum DslKind {
     TuringComplete,
 }
 
+/// 这是一个特殊的 Provider，它不跑 Rust 代码，而是启动一个新的 TC-15 VM
+struct VirtualDslProvider {
+    id: String,
+    entry_pc: u16,
+    firmware: Vec<u8>,
+    storage: Arc<dyn ContractStorage>,
+}
+
 /// DSL 提供者接口 (由开发者实现)
 /// 所有方法都是同步的，因为它们将在 blocking_thread 中被调用
-pub trait DslProvider: Send + Sync {
-    /// DSL 的唯一标识符 (e.g., "etp.dsl.json_logic")
-    fn id(&self) -> &str;
+impl DslProvider for VirtualDslProvider {
+    fn id(&self) -> &str { &self.id }
+    fn kind(&self) -> DslKind { DslKind::TuringComplete }
 
-    /// DSL 的类型
-    fn kind(&self) -> DslKind;
+    fn execute_declarative(&self, _: &str, _: &Value) -> Result<Value> {
+        Err(anyhow!("Virtual providers are Turing Complete only"))
+    }
 
-    /// [声明式] 执行逻辑
-    fn execute_declarative(&self, script: &str, context: &Value) -> Result<Value>;
-
-    /// [图灵完备] 编译逻辑 (针对 TC-15)
-    /// 返回: TC-15 机器码
     #[cfg(feature = "tc15-tcc")]
-    fn compile_to_vm(&self, script: &str) -> Result<Vec<u8>>;
+    fn compile_to_vm(&self, _: &str) -> Result<Vec<u8>> {
+        // 它已经是机器码了，直接返回镜像
+        Ok(self.firmware.clone())
+    }
+}
+
+// 为 DslRegistry 实现 SystemBus
+impl SystemBus for DslRegistry {
+    fn register_dynamic_provider(&self, id: &str, entry_pc: u16, code: Vec<u8>) -> Result<()> {
+        let new_provider = Arc::new(VirtualDslProvider {
+            id: id.to_string(),
+            entry_pc,
+            firmware: code,
+            storage: self.vm_storage.clone(),
+        });
+        
+        // 核心：直接插入现有的 HashMap，实现秒级进化
+        self.register(new_provider); 
+        Ok(())
+    }
 }
 
 // ============================================================================

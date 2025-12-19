@@ -33,6 +33,7 @@ ultrafileserver = []
 safefs = ["dep:argon2", "dep:memmap2", "dep:users", "dep:nix"]
 tc15-tcc = [] # 开启 TC-15 虚拟机与 TCC 编译器扩展
 dsl-runtime = ["dep:serde", "dep:serde_json", "dep:nom"]
+evolve-ui = ["tc15-tcc", "dsl-runtime"] # 便捷进化接口特性
 
 # --- 语言绑定支持 (Super Support Features) ---
 # 开启对应的 feature 会引入特定语言的胶水库
