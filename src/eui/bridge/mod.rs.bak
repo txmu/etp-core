@@ -1,0 +1,48 @@
+// src/eui/bridge/mod.rs
+
+use anyhow::{Result, anyhow};
+use log::{info, warn, error};
+use crate::network::node::{EtpHandle, Command};
+use super::EuiCommand;
+
+/// 指令桥接器：负责将 UI 交互翻译为内核指令
+pub struct UiCommandBridge {
+    handle: EtpHandle,
+}
+
+impl UiCommandBridge {
+    pub fn new(handle: EtpHandle) -> Self {
+        Self { handle }
+    }
+
+    /// 执行 UI 动作。此方法通常由具体的 Backend 在检测到用户点击按钮或输入命令后调用。
+    pub async fn dispatch(&self, cmd: EuiCommand) -> Result<()> {
+        match cmd {
+            EuiCommand::DisconnectPeer(addr_str) => {
+                info!("UIBridge: Requesting disconnect for {}", addr_str);
+                // 这里暂未在 node.rs 中实现特定断开指令，可以通过 Shutdown 会话模拟
+                // 生产环境应在 Command 中增加 CloseSession 变体
+                Ok(())
+            }
+            EuiCommand::ToggleCoverTraffic(enabled) => {
+                // 直接通过 Handle 向内核发射指令（如果内核配置支持原子更新）
+                debug!("UIBridge: Toggle Cover Traffic -> {}", enabled);
+                // 示例：向内核注入配置修改指令 (此处依赖 node.rs 的 Command 扩展)
+                Ok(())
+            }
+            EuiCommand::ShutdownNode => {
+                warn!("UIBridge: SYSTEM SHUTDOWN TRIGGERED FROM UI");
+                self.handle.shutdown().await.map_err(|e| anyhow!(e.to_string()))
+            }
+            EuiCommand::TriggerRekey(addr_str) => {
+                debug!("UIBridge: Forced rekey for {}", addr_str);
+                // 逻辑同 Disconnect
+                Ok(())
+            }
+            _ => {
+                warn!("UIBridge: Command {:?} not yet implemented", cmd);
+                Ok(())
+            }
+        }
+    }
+}

@@ -41,6 +41,9 @@ pub mod fusion_nexus;
 #[cfg(feature = "dark-news")]
 pub mod dark_news;
 
+#[cfg(feature = "dark-news")]
+pub mod dark_news_reverse;
+
 // ============================================================================
 //  统一重新导出关键结构 (方便外部使用)
 // ============================================================================
@@ -59,3 +62,6 @@ pub use fusion_nexus::{FusionNexusFlavor, NexusControlCmd};
 
 #[cfg(feature = "dark-news")]
 pub use dark_news::DarkNewsFlavor;
+
+#[cfg(feature = "dark-news")]
+pub use dark_news_reverse::{DarkNewsReverseGatewayFlavor, UsenetUpstreamConfig, ClearwebExportPolicy};

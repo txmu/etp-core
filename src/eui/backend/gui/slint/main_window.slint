@@ -1,0 +1,256 @@
+// src/eui/backend/gui/slint/main_window.slint
+
+import { Button, VerticalBox, HorizontalBox, ScrollView, StandardListView, LineEdit } from "std-widgets.slint";
+
+// --- 复杂数据结构 ---
+export struct RssEntry {
+    title: string,
+    source: string,
+    date: string,
+    link: string,
+    is_hot: bool,
+}
+
+export struct SessionEntry {
+    identity: string,
+    addr: string,
+    rtt: string,
+    flavor: string,
+    bytes_tx: string,
+    bytes_rx: string,
+    status_color: color,
+}
+
+// --- 自定义组件：流量直方图 (Histogram) ---
+component TrafficBar {
+    in property <float> value; // 0.0 to 1.0
+    in property <color> bar_color;
+    Rectangle {
+        width: 6px;
+        height: parent.height * value;
+        background: bar_color;
+        border-radius: 2px;
+        y: parent.height - self.height;
+        animate height { duration: 200ms; easing: ease-out; }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "ETP-CORE // Evolutionary Intelligence Terminal";
+    min-width: 1100px;
+    min-height: 800px;
+    
+    // --- 动态主题系统 (Theming) ---
+    in property <bool> cyberpunk_mode: true;
+    property <color> bg_main: cyberpunk_mode ? #0d0f18 : #f0f2f5;
+    property <color> bg_card: cyberpunk_mode ? #161925 : #ffffff;
+    property <color> accent: cyberpunk_mode ? #00f2ff : #1890ff;
+    property <color> text_main: cyberpunk_mode ? #c0caf5 : #333333;
+    property <color> text_dim: cyberpunk_mode ? #565f89 : #888888;
+
+    background: bg_main;
+    default-font-family: "Segoe UI", "PingFang SC", "Roboto", sans-serif;
+
+    // --- 状态绑定 ---
+    in property <string> node_id_short: "0x0000";
+    in property <string> node_uptime: "0d 0h 0m";
+    in property <string> total_in: "0 B";
+    in property <string> total_out: "0 B";
+    in property <string> bps_in: "0 KB/s";
+    in property <string> bps_out: "0 KB/s";
+    in property <[float]> history_in: [0.1, 0.2, 0.5, 0.3]; // 供直方图使用
+    in property <[float]> history_out: [0.05, 0.1, 0.4, 0.2];
+    
+    in property <[SessionEntry]> sessions: [];
+    in property <[RssEntry]> rss_news: [];
+    in property <[string]> active_flavors: ["VPN", "DARKNEWS"];
+
+    // --- 接口回调 ---
+    callback disconnect_peer(string);
+    callback rekey_peer(string);
+    callback add_rss(string);
+    callback shutdown_node();
+    callback open_external_link(string);
+
+    HorizontalBox {
+        padding: 0;
+        spacing: 0;
+
+        // A. 左侧导航边栏 (Sidebar)
+        Rectangle {
+            width: 80px;
+            background: bg_card;
+            border-width: 1px;
+            border-color: cyberpunk_mode ? #1f2335 : #d9d9d9;
+            
+            VerticalBox {
+                padding: 15px;
+                spacing: 30px;
+                alignment: start;
+                
+                // Logo 占位
+                Rectangle {
+                    height: 50px;
+                    background: accent;
+                    border-radius: 10px;
+                    Text { text: "Σ"; font-size: 24px; color: bg_main; font-weight: 800; }
+                }
+                
+                // 模拟导航图标
+                for icon in ["󰙯", "󰒍", "󰭹", "󰒓"] : Text {
+                    text: icon;
+                    font-size: 24px;
+                    color: text_dim;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
+        // B. 主内容区
+        VerticalBox {
+            padding: 25px;
+            spacing: 20px;
+
+            // 1. Top Bar
+            HorizontalBox {
+                padding: 0;
+                Text {
+                    text: "NODE // " + node_id_short;
+                    font-size: 22px;
+                    font-weight: 800;
+                    color: text_main;
+                }
+                Rectangle { horizontal-stretch: 1; }
+                for flavor in active_flavors : Rectangle {
+                    background: accent.with-alpha(0.1);
+                    border-width: 1px;
+                    border-color: accent;
+                    border-radius: 4px;
+                    width: 80px;
+                    height: 24px;
+                    Text { text: flavor; color: accent; font-size: 10px; font-weight: 700; }
+                }
+            }
+
+            // 2. 核心实时指标 (Monitor Panel)
+            HorizontalBox {
+                height: 180px;
+                spacing: 20px;
+
+                // 下行速率卡片 (含直方图)
+                Rectangle {
+                    background: bg_card;
+                    border-radius: 12px;
+                    VerticalBox {
+                        padding: 15px;
+                        Text { text: "INGRESS BANDWIDTH"; color: #9ece6a; font-size: 12px; font-weight: 700; }
+                        Text { text: bps_in; font-size: 32px; font-weight: 800; color: text_main; }
+                        HorizontalBox {
+                            alignment: end;
+                            height: 60px;
+                            spacing: 2px;
+                            for val in history_in : TrafficBar { value: val; bar_color: #9ece6a; }
+                        }
+                    }
+                }
+
+                // 上行速率卡片
+                Rectangle {
+                    background: bg_card;
+                    border-radius: 12px;
+                    VerticalBox {
+                        padding: 15px;
+                        Text { text: "EGRESS BANDWIDTH"; color: #7dcfff; font-size: 12px; font-weight: 700; }
+                        Text { text: bps_out; font-size: 32px; font-weight: 800; color: text_main; }
+                        HorizontalBox {
+                            alignment: end;
+                            height: 60px;
+                            spacing: 2px;
+                            for val in history_out : TrafficBar { value: val; bar_color: #7dcfff; }
+                        }
+                    }
+                }
+            }
+
+            // 3. 混合列表区
+            HorizontalBox {
+                spacing: 20px;
+
+                // 会话列表
+                Rectangle {
+                    horizontal-stretch: 3;
+                    background: bg_card;
+                    border-radius: 12px;
+                    VerticalBox {
+                        Text { text: "PEER REGISTRY"; color: text_dim; font-weight: 700; }
+                        ScrollView {
+                            VerticalBox {
+                                alignment: start;
+                                for s in sessions : Rectangle {
+                                    height: 50px;
+                                    background: bg_main.with-alpha(0.5);
+                                    border-radius: 6px;
+                                    HorizontalBox {
+                                        Rectangle { width: 4px; background: s.status_color; border-radius: 2px; }
+                                        Text { text: s.identity; width: 120px; overflow: elide; color: text_main; }
+                                        Text { text: s.addr; color: text_dim; width: 180px; }
+                                        Text { text: s.rtt + "ms"; color: #bb9af7; width: 60px; }
+                                        Text { text: s.flavor; color: text_dim; horizontal-stretch: 1; }
+                                        Button { text: "Rekey"; clicked => { root.rekey_peer(s.addr) } }
+                                        Button { text: "Kick"; clicked => { root.disconnect_peer(s.addr) } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // RSS 情报流
+                Rectangle {
+                    horizontal-stretch: 2;
+                    background: bg_card;
+                    border-radius: 12px;
+                    VerticalBox {
+                        Text { text: "INTELLIGENCE (RSSHUB)"; color: #e0af68; font-weight: 700; }
+                        ScrollView {
+                            VerticalBox {
+                                alignment: start;
+                                for n in rss_news : Rectangle {
+                                    height: 70px;
+                                    background: n.is_hot ? #e0af68.with-alpha(0.1) : transparent;
+                                    border-bottom-width: 1px;
+                                    border-bottom-color: #1f2335;
+                                    VerticalBox {
+                                        Text { text: n.title; font-weight: 600; color: text_main; overflow: elide; }
+                                        HorizontalBox {
+                                            Text { text: n.source; color: #9ece6a; font-size: 11px; }
+                                            Text { text: n.date; color: text_dim; font-size: 11px; }
+                                            Rectangle { horizontal-stretch: 1; }
+                                            Button { text: "Open"; clicked => { root.open_external_link(n.link) } }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 4. 底部状态与操作
+            HorizontalBox {
+                height: 40px;
+                Text { text: "System Uptime: " + node_uptime; color: text_dim; vertical-alignment: center; }
+                Rectangle { horizontal-stretch: 1; }
+                Button { 
+                    text: "Toggle Theme"; 
+                    clicked => { cyberpunk_mode = !cyberpunk_mode; }
+                }
+                Button { 
+                    text: "Emergency Shutdown"; 
+                    primary: true; 
+                    clicked => { root.shutdown_node(); }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <requires lib="gtk+" version="3.20"/>
+  <object class="GtkWindow" id="main_window">
+    <property name="title">ETP-CORE // GTK Evolutionary Terminal</property>
+    <property name="default_width">1000</property>
+    <property name="default_height">700</property>
+    <child>
+      <object class="GtkBox">
+        <property name="orientation">vertical</property>
+        <property name="spacing">10</property>
+        <property name="margin">15</property>
+        
+        <!-- Header Info -->
+        <child>
+          <object class="GtkBox">
+            <property name="orientation">horizontal</property>
+            <child>
+              <object class="GtkLabel" id="lbl_node_id">
+                <property name="label">Node ID: 0x0000</property>
+                <attributes>
+                  <attribute name="weight" value="bold"/>
+                  <attribute name="size" value="15000"/>
+                </attributes>
+              </object>
+            </child>
+            <child>
+              <object class="GtkLabel" id="lbl_uptime">
+                <property name="margin_left">20</property>
+                <property name="label">Uptime: 0s</property>
+              </object>
+            </child>
+          </object>
+        </child>
+
+        <!-- Metrics Display -->
+        <child>
+          <object class="GtkGrid">
+            <property name="column_spacing">20</property>
+            <property name="row_spacing">10</property>
+            <property name="halign">center</property>
+            <child>
+              <object class="GtkLabel"><property name="label">INGRESS:</property></object>
+              <packing><property name="left_attach">0</property><property name="top_attach">0</property></packing>
+            </child>
+            <child>
+              <object class="GtkLabel" id="lbl_bps_in">
+                <property name="label">0 KB/s</property>
+                <attributes><attribute name="foreground" value="#4e9a06"/></attributes>
+              </object>
+              <packing><property name="left_attach">1</property><property name="top_attach">0</property></packing>
+            </child>
+            <child>
+              <object class="GtkLabel"><property name="label">EGRESS:</property></object>
+              <packing><property name="left_attach">0</property><property name="top_attach">1</property></packing>
+            </child>
+            <child>
+              <object class="GtkLabel" id="lbl_bps_out">
+                <property name="label">0 KB/s</property>
+                <attributes><attribute name="foreground" value="#3465a4"/></attributes>
+              </object>
+              <packing><property name="left_attach">1</property><property name="top_attach">1</property></packing>
+            </child>
+          </object>
+        </child>
+
+        <!-- Main Content Area -->
+        <child>
+          <object class="GtkPaned">
+            <property name="position">600</property>
+            <!-- Sessions -->
+            <child>
+              <object class="GtkFrame">
+                <property name="label">Active Sessions</property>
+                <child>
+                  <object class="GtkScrolledWindow">
+                    <child>
+                      <object class="GtkTreeView" id="tree_sessions">
+                        <!-- Columns will be added in Rust code -->
+                      </object>
+                    </child>
+                  </object>
+                </child>
+              </object>
+            </child>
+            <!-- RSS Feed -->
+            <child>
+              <object class="GtkFrame">
+                <property name="label">Intelligence Feed (RSS)</property>
+                <child>
+                  <object class="GtkScrolledWindow">
+                    <child>
+                      <object class="GtkListBox" id="list_rss">
+                        <!-- Items added dynamically -->
+                      </object>
+                    </child>
+                  </object>
+                </child>
+              </object>
+            </child>
+          </object>
+        </child>
+
+        <!-- Footer -->
+        <child>
+          <object class="GtkButtonBox">
+            <property name="layout_style">end</property>
+            <child>
+              <object class="GtkButton" id="btn_shutdown">
+                <property name="label">Emergency Shutdown</property>
+              </object>
+            </child>
+          </object>
+        </child>
+      </object>
+    </child>
+  </object>
+</interface>

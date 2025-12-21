@@ -18,6 +18,7 @@ use rand::Rng;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, AeadInPlace}; 
 use blake3;
 use serde::{Serialize, Deserialize};
+use log::{info, warn, error, debug};
 
 use crate::error::EtpError;
 use crate::plugin::flavors::control::ControlCategory;
@@ -423,6 +424,13 @@ pub enum Command {
     DhtFindNode { target_id: NodeID, reply: oneshot::Sender<Result<Vec<NodeInfo>>> },
     DhtStore { key: NodeID, value: Vec<u8>, ttl: u32 },
     GetStats { reply: oneshot::Sender<String> },
+    ListSessions { reply: oneshot::Sender<Result<Vec<crate::eui::state::SessionBrief>>> },
+    /// [新增] 强制断开指定对等点的会话
+    CloseSession { target: SocketAddr, reason: String },
+    /// [新增] 强制对指定对等点执行密钥重协商 (Rekey)
+    RekeySession { target: SocketAddr },
+    /// [新增] 动态更新匿名化配置（如掩护流量开关）
+    UpdateAnonymityConfig { enable_cover: bool },
     Shutdown,
 }
 
@@ -1064,6 +1072,104 @@ impl EtpEngine {
                 } else {
                     warn!("Control: Session not found for {}", target);
                 }
+            },
+            
+            Command::ListSessions { reply } => {
+                let mut sessions_list = Vec::new();
+                
+                // 遍历当前内存中所有的活跃会话
+                for entry in self.ctx.sessions.iter() {
+                    let addr = *entry.key();
+                    let session = entry.value().read();
+                    
+                    // 提取会话元数据
+                    // 注意：此处 peer_identity 优先取远程公钥的 Hex 缩写
+                    let peer_pub = session.crypto.get_remote_static()
+                        .map(|k| hex::encode(&k[0..8]))
+                        .unwrap_or_else(|| "anonymous".to_string());
+            
+                    sessions_list.push(crate::eui::state::SessionBrief {
+                        peer_identity: peer_pub,
+                        socket_addr: addr.to_string(),
+                        bytes_sent: session.bytes_sent_total,
+                        bytes_recv: 0, // 此处可根据业务需要增加统计
+                        rtt_ms: session.reliability.congestion.get_rto().as_millis() as u32 / 4, // 估算 RTT
+                        uptime_secs: session.created_at.elapsed().as_secs(),
+                        flavor: session.flavor.capability_id(),
+                    });
+                }
+                
+                // 返回结果，若发送失败说明 UI 已经关闭了接收端，忽略即可
+                let _ = reply.send(Ok(sessions_list));
+            },
+            
+            // --- [新增] 强制断开会话 ---
+            Command::CloseSession { target, reason } => {
+                info!("Engine: Manual close requested for {} (Reason: {})", target, reason);
+                
+                // 首先尝试发送 Close 帧给对端，执行优雅关闭
+                let close_frame = Frame::Close { 
+                    error_code: 0, // 0 表示正常关闭
+                    reason: reason.clone() 
+                };
+                
+                // 调用内部 send_frames 发送终结报文
+                // 注意：send_frames 内部会检查 session 是否存在
+                let _ = self.send_frames(target, vec![close_frame]).await;
+
+                // 物理移除会话状态
+                if let Some(_) = self.ctx.sessions.remove(&target) {
+                    self.ctx.metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+                    debug!("Engine: Session {} removed from registry.", target);
+                }
+            },
+
+            // --- [新增] 强制密钥轮换 (Rekey) ---
+            Command::RekeySession { target } => {
+                if let Some(session_lock) = self.ctx.sessions.get(&target) {
+                    let mut session = session_lock.write();
+                    
+                    // 调用 Noise 状态机执行 Rekey
+                    match session.crypto.rekey() {
+                        Ok(_) => {
+                            // 重置安全计数器
+                            session.bytes_sent_since_rekey = 0;
+                            session.last_rekey_time = Instant::now();
+                            info!("Engine: Manual Rekey successful for {}", target);
+                            
+                            // 立即发送一个 Padding 包以同步新的对称密钥特征（触发对端响应）
+                            drop(session); // 释放锁以调用 send_frames
+                            let _ = self.send_frames(target, vec![]).await;
+                        },
+                        Err(e) => {
+                            error!("Engine: Manual Rekey failed for {}: {}", target, e);
+                        }
+                    }
+                } else {
+                    warn!("Engine: Rekey failed - Session {} not found", target);
+                }
+            },
+
+            // --- [新增] 动态更新匿名化配置 ---
+            Command::UpdateAnonymityConfig { enable_cover } => {
+                info!("Engine: Dynamic Anonymity Update -> CoverTraffic={}", enable_cover);
+                
+                // A. 更新当前所有活跃会话的掩护流量引擎状态
+                // DashMap 的迭代器是分片加锁的，在大规模连接时依然高效
+                for mut entry in self.ctx.sessions.iter_mut() {
+                    let mut session = entry.value().write();
+                    session.cover_engine.enabled = enable_cover;
+                    
+                    // 如果开启了掩护流量，重置其检查时间戳
+                    if enable_cover {
+                        session.cover_engine.last_check = Instant::now();
+                    }
+                }
+
+                // B. 注意：由于 self.ctx.config 是 Arc<NodeConfig>，它是不可变的。
+                // 生产级建议：在创建 ProcessingContext 时使用 Arc<RwLock<NodeConfig>>，
+                // 或者在这里更新一个独立的“运行时策略集（RuntimePolicy）”。
+                // 为保持当前架构兼容性，此处逻辑已确保所有活跃 Session 立即生效。
             },
 
             Command::Connect { target, remote_pub } => {

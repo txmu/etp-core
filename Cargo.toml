@@ -1,6 +1,6 @@
 [package]
 name = "etp-core"
-version = "2.3.5"
+version = "2.4.0"
 edition = "2025"
 authors = ["ETP Core Team"]
 description = "Evolutionary Transport Protocol Core Library"
@@ -90,6 +90,56 @@ binding-fusion = ["binding-experimental", "dep:libc"]
 # Carbon 需要 libc
 binding-carbon = ["binding-experimental", "dep:libc"]
 
+# EUI总开关
+eui = ["eui-cli", "eui-tui", "eui-gui"]
+
+# --- 1. CLI 层 ---
+# 使用 getopts 提供基础命令行解析
+eui-cli = ["dep:getopts", "dep:colored"]
+
+# --- 2. TUI (终端界面) 层 ---
+eui-tui = ["eui-tui-ncurses", "eui-tui-dialog"]
+# 基于 ncurses 的经典黑客风格界面
+eui-tui-ncurses = ["dep:ncurses"]
+# 基于系统 dialog/newt 工具的交互（通过封装库调用）
+eui-tui-dialog = ["dep:dialog"]
+
+# --- 3. GUI (图形界面) 层 ---
+
+# --- Web / Hybrid 桥接支持 ---
+# 这里定义一个内部使用的辅助特性，或者直接让具体的后端依赖它们
+eui-web-core = ["dep:tokio-tungstenite", "dep:futures-util", "dep:serde_json"]
+
+eui-gui = [
+    "eui-gui-gtk", 
+    "eui-gui-slint", 
+    "eui-gui-fltk", 
+    "eui-gui-wx", 
+    "eui-gui-tk",
+    "eui-gui-druid"
+]
+
+# GTK 支持 (默认支持 gtk-rs 包装的 GTK3/4)
+eui-gui-gtk = ["dep:gtk"]
+# Slint: 2025年 Rust 首选现代 GUI 框架
+eui-gui-slint = ["dep:slint"]
+# FLTK: 极小体积，适合静态链接的工具
+eui-gui-fltk = ["dep:fltk"]
+# wxWidgets: 跨平台原生外观
+eui-gui-wx = ["dep:wx_rust"]
+# Tk: 兼容老旧系统的终极回退方案
+eui-gui-tk = ["dep:tk"]
+# Qt: 由于 Qt 的复杂性，通常通过 cpp 桥接
+eui-gui-qt = ["dep:qmetaobject"]
+# 混合桌面: 提供 WebSocket 桥接给外部 Electron/Tauri
+eui-gui-tauri = ["eui-web-core"]
+eui-gui-electron = ["eui-web-core"]
+# 启用 Druid 后端
+eui-gui-druid = ["dep:druid"]
+
+# 额外的RSS支持
+eui-rss = ["dep:rss", "dep:reqwest", "dep:html-escape"]
+
 [profile.release]
 lto = true
 codegen-units = 1
@@ -165,6 +215,11 @@ url = { version = "2.4", optional = true }
 regex = { version = "1.9", optional = true }
 flate2 = { version = "1.0", optional = true } # 用于 PoolMemory 的 zlib 压缩
 
+# RSS 解析核心
+rss = { version = "0.15", optional = true }
+# html-escape: 处理 RSS 内容中的 XML 转义
+html-escape = { version = "0.2", optional = true }
+
 # --- Quantum Security (Optional) ---
 # 仅在开启 quantum-encryption 时引入
 pqcrypto-kyber = { version = "0.8", optional = true }
@@ -219,6 +274,45 @@ mlua = { version = "0.9", features = ["lua54", "vendored", "async"], optional = 
 
 # Go 绑定通常不需要额外 crate，但在 FFI 边界处理 panic 是好习惯
 # 我们沿用已有的 libc 和 log
+
+# --- EUI CLI 依赖 ---
+getopts = { version = "0.2", optional = true }
+
+# 用于 CLI 终端着色
+colored = { version = "2.0", optional = true }
+
+# --- EUI TUI 依赖 ---
+ncurses = { version = "6.0", optional = true }
+# dialog crate 是对系统 dialog 工具的 Rust 封装
+dialog = { version = "0.3", optional = true }
+
+# --- EUI GUI 依赖 ---
+
+# 1. Slint: 现代、轻量、高性能
+slint = { version = "1.3", optional = true }
+
+# 2. GTK: 针对 Linux 深度优化
+# 注意：这需要系统安装 gtk 开发库
+gtk = { version = "0.18", optional = true, features = ["v3_24"] }
+
+# 3. FLTK: 适合嵌入式或超轻量分发
+fltk = { version = "1.4", optional = true }
+
+# 4. Qt (通过 QMetaObject 实现与 Qt5 的互操作)
+qmetaobject = { version = "0.1", optional = true }
+
+# 5. wxWidgets (wx_rust)
+wx_rust = { version = "0.0.1", optional = true }
+
+# 6. Tk (通过 Tcl 桥接)
+tk = { version = "0.1", optional = true }
+
+# 7. Druid 核心库：启用 "im" 特性以支持高效的不可变数据结构映射
+druid = { version = "0.8", optional = true, features = ["im", "image"] }
+
+# WebSocket 核心 (用于 WebBackend)
+tokio-tungstenite = { version = "0.21", optional = true }
+futures-util = { version = "0.3", optional = true }
 
 # --- Platform Specific Dependencies ---
 
