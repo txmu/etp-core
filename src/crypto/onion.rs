@@ -199,10 +199,8 @@ impl OnionCrypto {
         let padded_plaintext = cipher.decrypt(&nonce.into(), ciphertext)
             .map_err(|_| anyhow!("Onion decryption integrity check failed"))?;
 
-        // 5. 去除填充
-        let plaintext = remove_padding(&padded_plaintext)?;
-
-        Ok(plaintext)
+        // 5. 去除填充 (高性能零拷贝模式)
+        remove_padding(padded_plaintext)
     }
 }
 
@@ -224,72 +222,62 @@ fn derive_nonce(secret: &[u8], info: &str) -> [u8; 12] {
 }
 
 /// 应用填充 (ISO/IEC 7816-4: Add 0x80 then 0x00...)
+/// (新版：末尾字节记录长度法)
+/// 格式: [原始数据] [随机填充字节...] [填充长度(1B)]
 fn apply_padding(data: &[u8], strategy: PaddingStrategy) -> Result<Vec<u8>> {
     let mut output = data.to_vec();
+    let current_len = data.len();
     
-    match strategy {
-        PaddingStrategy::None => {},
+    // 确定目标总长度（包含 1 字节的长度标记）
+    let target_total_len = match strategy {
+        PaddingStrategy::None => current_len + 1, // 仅增加 1 字节标记位
         PaddingStrategy::BlockAligned(block_size) => {
             if block_size == 0 { return Err(anyhow!("Invalid block size 0")); }
-            // ISO 7816-4 padding: Append 0x80, then 0x00 until aligned
-            output.push(0x80);
-            while output.len() % block_size != 0 {
-                output.push(0x00);
-            }
+            // 确保至少留出 1 字节存长度，计算下一个对齐点
+            ((current_len + 1 + block_size - 1) / block_size) * block_size
         },
         PaddingStrategy::FixedTotal(total_size) => {
-            // Include payload + 1 byte padding marker (0x80)
-            if data.len() + 1 > total_size {
+            if current_len + 1 > total_size {
                 return Err(anyhow!("Payload too large for fixed size padding"));
             }
-            output.push(0x80);
-            while output.len() < total_size {
-                output.push(0x00);
-            }
+            total_size
         }
-    }
+    };
+
+    let padding_len = target_total_len - current_len - 1; // 减去原始数据和最后的长度字节
+    
+    // 填充随机数据而非 0x00，以获得更好的抗分析能力
+    let mut rng = rand::thread_rng();
+    let mut padding = vec![0u8; padding_len];
+    rng.fill_bytes(&mut padding);
+    output.extend(padding);
+
+    // 最后一个字节存储填充的长度 (0-254)
+    // 如果填充超过 255，此逻辑需修改为 u16，但对于 MTU 1500 来说 u8 足够
+    output.push(padding_len as u8);
+
     Ok(output)
 }
 
-/// 去除填充
-fn remove_padding(data: &[u8]) -> Result<Vec<u8>> {
-    // 检查是否应用了 Padding (检查 strategy 比较难，这里假设使用了 ISO 7816-4 风格)
-    // 如果是 PaddingStrategy::None，数据可能没有 0x80。
-    // 为了健壮性，这里需要一个简单的协议约定：Onion层总是使用 ISO 7816-4 填充吗？
-    // 为了兼容 None 模式，我们在 open 接口并没有传 config。
-    // 这是一个设计权衡。
-    // 改进：为了支持 None 模式和 Padding 模式混用，我们应该在 Header 里加一个 Flag，
-    // 或者总是应用 Padding（即使是追加一个 0x80）。
-    // 在本实现中，我们假定：如果 config 指定了 Padding，则会追加 0x80...
-    // 接收端逻辑：从尾部扫描第一个非 0x00 的字节。如果是 0x80，则移除它及后面的 0x00。
-    // 如果尾部非 0x00 且非 0x80，或者全 0，则视为无 Padding (或者数据本身就是这样)。
-    // 这是一个概率冲突。
-    
-    // **更安全的做法**：总是强制追加 Padding (0x80...)。
-    // 为了简化且保证正确性，我们在 apply_padding 的 None 模式下不做任何事。
-    // 在 remove_padding 时，无法区分原始数据的 0x80 结尾和 Padding。
-    
-    // **修正方案**：为了彻底解决，我们默认所有加密内容都是 "Unpadded" 除非显式需要。
-    // 但为了抗分析，Padding 很重要。
-    // 我们在这里使用一种启发式：从后往前找 0x80。
-    
-    if data.is_empty() { return Ok(Vec::new()); }
-    
-    let mut i = data.len();
-    while i > 0 {
-        i -= 1;
-        if data[i] == 0x80 {
-            // Found padding start
-            return Ok(data[0..i].to_vec());
-        } else if data[i] != 0x00 {
-            // Found non-zero, non-0x80 byte. Assume NO padding was applied.
-            // This works if we assume padding is ONLY 0x80 followed by 0x00s.
-            return Ok(data.to_vec());
-        }
+/// 去除填充 (新版：末尾字节记录长度法)
+fn remove_padding(mut data: Vec<u8>) -> Result<Vec<u8>> {
+    if data.is_empty() {
+        return Err(anyhow!("Empty packet"));
     }
-    
-    // Fallback: entire buffer was 0x00 or empty, return as is
-    Ok(data.to_vec())
+
+    // 1. 取出最后一个字节，获取填充长度
+    let padding_len = data.pop().ok_or(anyhow!("Missing padding length byte"))? as usize;
+
+    // 2. 安全边界检查
+    if padding_len > data.len() {
+        return Err(anyhow!("Invalid padding length: {} > data len {}", padding_len, data.len()));
+    }
+
+    // 3. 截断数据
+    let final_len = data.len() - padding_len;
+    data.truncate(final_len);
+
+    Ok(data)
 }
 
 // --- 单元测试 ---

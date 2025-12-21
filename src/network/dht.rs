@@ -8,81 +8,65 @@ use std::path::Path;
 use std::fs;
 use std::io::Write;
 use serde::{Serialize, Deserialize};
-use log::{debug, trace, info, warn};
+use log::{debug, trace, info, warn, error};
 use rand::{Rng, thread_rng};
-use anyhow::{Result, Context};
+use anyhow::{Result, anyhow, Context};
 
 use crate::NodeID;
-use crate::common::NodeInfo; // 使用统一结构
+use crate::common::NodeInfo;
 
 // ============================================================================
-//  常量配置
+//  协议常量与信誉分配置
 // ============================================================================
 
-const K_BUCKET_SIZE: usize = 20;  // k
-const ID_BITS: usize = 256;       // b
-const REPLACEMENT_CACHE_SIZE: usize = 5;
+const ID_BITS: usize = 256;       // Kademlia ID 位数 (256位)
 
-// 抗女巫配置 (仅当 feature 开启时生效)
-const MAX_PEERS_PER_IPV4_SUBNET: usize = 2; // 同一个 /24 网段最多允许 2 个节点
-const MAX_PEERS_PER_IPV6_SUBNET: usize = 4; // 同一个 /64 网段最多允许 4 个节点
-
-// 信誉系统配置
 const REPUTATION_INITIAL: i32 = 100;
-const REPUTATION_MAX: i32 = 1000;
-const REPUTATION_MIN_BAN: i32 = -50; // 低于此分拉黑
+const REPUTATION_MAX: i32     = 1000;
+const REPUTATION_MIN_BAN: i32 = -50; // 低于此分视为恶意并封禁
+
 const SCORE_PING_SUCCESS: i32 = 5;
-const SCORE_PING_FAIL: i32 = -10;
+const SCORE_PING_FAIL: i32    = -10;
 
-// ============================================================================
-//  数据结构定义
-// ============================================================================
-
-/// 节点能力位掩码
+/// 节点能力位掩码 (用于 Discovery 协商)
 pub mod node_features {
-    pub const SERVICE_HOST: u32 = 1 << 0;  // 提供服务
-    pub const PUBLIC_IP:    u32 = 1 << 1;  // 拥有公网 IP
-    pub const DHT_STORE:    u32 = 1 << 2;  // 允许存储数据
+    pub const SERVICE_HOST: u32 = 1 << 0;  // 提供业务服务
+    pub const PUBLIC_IP:    u32 = 1 << 1;  // 拥有公网可达 IP
+    pub const DHT_STORE:    u32 = 1 << 2;  // 允许作为存储节点
 }
 
-impl NodeInfo {
-    pub fn new(id: NodeID, addr: SocketAddr) -> Self {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        Self {
-            id,
-            addr,
-            latency_ms: 0,
-            virtual_ip: None,
-            last_seen: now,
-            first_seen: now,
-            reputation: REPUTATION_INITIAL,
-            client_version: "Unknown".into(),
-            features: 0,
-        }
-    }
+// ============================================================================
+//  1. DHT 全局配置 (支持深度抗女巫动态调整)
+// ============================================================================
 
-    /// 更新活跃状态
-    pub fn touch(&mut self) {
-        self.last_seen = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    }
-
-    pub fn adjust_reputation(&mut self, delta: i32) {
-        self.reputation = (self.reputation + delta).clamp(REPUTATION_MIN_BAN - 10, REPUTATION_MAX);
-    }
-
-    pub fn is_banned(&self) -> bool {
-        self.reputation <= REPUTATION_MIN_BAN
-    }
-}
-
-/// DHT 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DhtConfig {
+    /// 是否启用虚拟网络 IP 映射 (240.x.x.x)
     pub enable_virtual_net: bool,
+    /// K 桶刷新间隔
     pub refresh_interval: Duration,
+    /// 节点未响应超时时间
     pub node_timeout: Duration,
+    /// 是否允许 Bogon/私有 IP (仅限局域网测试)
     pub allow_bogon_ips: bool,
+    /// 用于某些加密映射的内部种子
     pub secret_seed: [u8; 32],
+
+    // --- [手段 15/21] 增强型抗女巫动态配置 ---
+    /// K 桶容量 (典型值: 20, 64, 128, 256)
+    pub k_bucket_size: usize,
+    
+    /// IPv4 /24 (C段) 同一子网准入上限
+    pub max_per_ipv4_24: usize,
+    
+    /// IPv6 /64 (标准终端子网) 同一子网准入上限
+    pub max_per_ipv6_64: usize,
+    
+    /// IPv6 /48 (企业/站点级前缀) 同一前缀准入上限
+    pub max_per_ipv6_48: usize,
+    
+    /// IPv6 /32 (运营商/大型机构级前缀) 同一前缀准入上限
+    pub max_per_ipv6_32: usize,
 }
 
 impl Default for DhtConfig {
@@ -93,11 +77,21 @@ impl Default for DhtConfig {
             node_timeout: Duration::from_secs(3600),
             allow_bogon_ips: false,
             secret_seed: [0u8; 32],
+            
+            // 生产级抗攻击防御默认值
+            k_bucket_size: 128,
+            max_per_ipv4_24: 2,
+            max_per_ipv6_64: 2,
+            max_per_ipv6_48: 4,
+            max_per_ipv6_32: 8,
         }
     }
 }
 
-/// XOR 距离度量
+// ============================================================================
+//  2. 基础数学：XOR 距离度量与映射
+// ============================================================================
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Distance(pub [u8; 32]);
 
@@ -123,28 +117,23 @@ impl PartialOrd for Distance {
 }
 
 impl Ord for Distance {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.cmp(&other.0)
-    }
+    fn cmp(&self, other: &Self) -> Ordering { self.0.cmp(&other.0) }
 }
-
-// ============================================================================
-//  内部组件：虚拟网络映射
-// ============================================================================
 
 struct VirtualNetworkMapper;
 impl VirtualNetworkMapper {
+    /// 手段 17: 将 NodeID 确定性映射到 Class E 虚拟空间 (240.x.x.x)
     pub fn map_id_to_ip(id: &NodeID) -> Ipv4Addr {
         let len = id.len();
         let mut b = [id[len-4], id[len-3], id[len-2], id[len-1]];
-        b[0] = (b[0] & 0x0F) | 0xF0; // Class E mapping
-        if b[0] == 255 { b[0] = 254; }
+        b[0] = (b[0] & 0x0F) | 0xF0; 
+        if b[0] == 255 { b[0] = 254; } // 避开 255.x.x.x
         Ipv4Addr::new(b[0], b[1], b[2], b[3])
     }
 }
 
 // ============================================================================
-//  内部组件：K-Bucket (集成抗女巫逻辑)
+//  3. 核心：K-Bucket 实现 (含高性能内存管理与准入控制)
 // ============================================================================
 
 #[derive(Debug, PartialEq)]
@@ -152,8 +141,8 @@ pub enum DhtAddResult {
     Added,
     Updated,
     BucketFull { oldest_node: NodeInfo },
-    RejectedSybil, // 触发抗女巫规则
-    RejectedBanned, // 节点信誉过低
+    RejectedSybil,
+    RejectedBanned,
     Ignored,
 }
 
@@ -166,111 +155,108 @@ struct KBucket {
 }
 
 impl KBucket {
-    fn new() -> Self {
+    /// 预分配内存以应对高频路由交换
+    fn new(k_size: usize) -> Self {
         Self {
-            nodes: VecDeque::new(),
-            replacements: VecDeque::new(),
+            nodes: VecDeque::with_capacity(k_size),
+            replacements: VecDeque::with_capacity((k_size / 4).max(5)),
             last_updated: Instant::now(),
         }
     }
 
-    /// 核心更新逻辑
-    fn update(&mut self, mut incoming_node: NodeInfo) -> DhtAddResult {
-        // 1. 检查黑名单
-        if node.is_banned() {
+    /// [手段 15] 深度子网准入控制
+    #[cfg(feature = "dht_anti_sybil")]
+    fn check_sybil_limit(&self, incoming_ip: &IpAddr, config: &DhtConfig) -> bool {
+        let mut count_v4_24 = 0;
+        let mut count_v6_64 = 0;
+        let mut count_v6_48 = 0;
+        let mut count_v6_32 = 0;
+
+        for node in &self.nodes {
+            let existing_ip = node.addr.ip();
+            match (incoming_ip, existing_ip) {
+                (IpAddr::V4(new), IpAddr::V4(old)) => {
+                    // /24 检查 (前 3 字节)
+                    if new.octets()[0..3] == old.octets()[0..3] { count_v4_24 += 1; }
+                },
+                (IpAddr::V6(new), IpAddr::V6(old)) => {
+                    let n = new.segments();
+                    let o = old.segments();
+                    // /64: 前 4 段 (64 bits)
+                    if n[0..4] == o[0..4] { count_v6_64 += 1; }
+                    // /48: 前 3 段 (48 bits)
+                    if n[0..3] == o[0..3] { count_v6_48 += 1; }
+                    // /32: 前 2 段 (32 bits)
+                    if n[0..2] == o[0..2] { count_v6_32 += 1; }
+                },
+                _ => {}
+            }
+        }
+
+        match incoming_ip {
+            IpAddr::V4(_) => count_v4_24 < config.max_per_ipv4_24,
+            IpAddr::V6(_) => {
+                count_v6_64 < config.max_per_ipv6_64 && 
+                count_v6_48 < config.max_per_ipv6_48 &&
+                count_v6_32 < config.max_per_ipv6_32
+            }
+        }
+    }
+
+    /// 更新节点状态 (LRU 策略)
+    fn update(&mut self, mut incoming_node: NodeInfo, config: &DhtConfig) -> DhtAddResult {
+        // 1. 检查信誉黑名单
+        if incoming_node.reputation <= REPUTATION_MIN_BAN {
             return DhtAddResult::RejectedBanned;
         }
 
         self.last_updated = Instant::now();
-        node.touch();
-
-        // 2. 如果节点已存在，移至队尾并更新信息
+        
+        // 2. 如果节点已存在，移至末尾 (Most Recently Used)
         if let Some(idx) = self.nodes.iter().position(|n| n.id == incoming_node.id) {
-            // 找到本地已有的节点记录
             let mut existing = self.nodes.remove(idx).unwrap();
             
-            // --- 核心合并逻辑：保护本地主权字段 ---
-            
-            // 2.1. 更新网络参数 (信任对端声明的信息)
+            // 更新易变属性
             existing.addr = incoming_node.addr;
             existing.latency_ms = incoming_node.latency_ms;
             existing.virtual_ip = incoming_node.virtual_ip;
             existing.client_version = incoming_node.client_version;
             existing.features = incoming_node.features;
             
-            // 2.2. 保护本地参数 (绝对不信任对端在报文中声明的这些字段，因为它们已被 serde(skip))
-            // 实际上 incoming_node 里的这些字段现在是默认值
-            // 我们保留 existing 里的旧值并更新活跃时间
+            // 保持并刷新本地主权字段
             existing.touch(); 
-            
-            // 2.3. 重新插入队列（LRU 策略：移至末尾）
             self.nodes.push_back(existing);
             return DhtAddResult::Updated;
         }
 
-        // 3. 抗女巫攻击检查 (Sybil Guard)
-        // 仅当 feature 开启且 Bucket 非空时检查
+        // 3. 抗女巫防御检查
         #[cfg(feature = "dht_anti_sybil")]
         {
-            if !self.check_sybil_limit(&node.addr.ip()) {
-                warn!("DHT Anti-Sybil: Rejected {} due to subnet limit", node.addr);
+            if !self.check_sybil_limit(&incoming_node.addr.ip(), config) {
                 return DhtAddResult::RejectedSybil;
             }
         }
 
-        // 4. Bucket 未满，直接插入
-        if self.nodes.len() < K_BUCKET_SIZE {
-            self.nodes.push_back(node);
+        // 4. 桶未满，直接插入
+        if self.nodes.len() < config.k_bucket_size {
+            incoming_node.touch();
+            self.nodes.push_back(incoming_node);
             return DhtAddResult::Added;
         }
 
-        // 5. Bucket 已满，尝试放入替换列表
+        // 5. 桶已满，放入备选队列 (Replacements)
         let oldest = self.nodes.front().cloned().unwrap();
-        
-        // 替换列表也要做 Sybil 检查? 暂时不做，因为 Replacement 不参与路由，只是备胎。
-        // 但为了防止内存耗尽，Replacement 也要去重
-        if !self.replacements.iter().any(|n| n.id == node.id) {
-            self.replacements.push_back(node);
-            if self.replacements.len() > REPLACEMENT_CACHE_SIZE {
+        let max_replacements = (config.k_bucket_size / 4).max(5);
+
+        if !self.replacements.iter().any(|n| n.id == incoming_node.id) {
+            incoming_node.touch();
+            self.replacements.push_back(incoming_node);
+            if self.replacements.len() > max_replacements {
                 self.replacements.pop_front();
             }
         }
 
         DhtAddResult::BucketFull { oldest_node: oldest }
-    }
-
-    /// 计算并检查子网限制
-    #[cfg(feature = "dht_anti_sybil")]
-    fn check_sybil_limit(&self, ip: &IpAddr) -> bool {
-        let limit = match ip {
-            IpAddr::V4(_) => MAX_PEERS_PER_IPV4_SUBNET,
-            IpAddr::V6(_) => MAX_PEERS_PER_IPV6_SUBNET,
-        };
-
-        let current_count = self.nodes.iter().filter(|n| {
-            Self::is_same_subnet(&n.addr.ip(), ip)
-        }).count();
-
-        current_count < limit
-    }
-
-    #[cfg(feature = "dht_anti_sybil")]
-    fn is_same_subnet(a: &IpAddr, b: &IpAddr) -> bool {
-        match (a, b) {
-            (IpAddr::V4(a4), IpAddr::V4(b4)) => {
-                // /24 check: 前3个字节相同
-                let oct_a = a4.octets();
-                let oct_b = b4.octets();
-                oct_a[0] == oct_b[0] && oct_a[1] == oct_b[1] && oct_a[2] == oct_b[2]
-            },
-            (IpAddr::V6(a6), IpAddr::V6(b6)) => {
-                // /64 check: 前8个字节相同
-                let seg_a = a6.segments();
-                let seg_b = b6.segments();
-                seg_a[0..4] == seg_b[0..4]
-            },
-            _ => false
-        }
     }
 
     fn mark_success(&mut self, id: &NodeID) {
@@ -282,39 +268,36 @@ impl KBucket {
         }
     }
 
-    fn mark_failed(&mut self, id: &NodeID) {
+    fn mark_failed(&mut self, id: &NodeID, config: &DhtConfig) {
         let mut remove_idx = None;
         if let Some(idx) = self.nodes.iter().position(|n| n.id == *id) {
             let node = &mut self.nodes[idx];
             node.adjust_reputation(SCORE_PING_FAIL);
-            
-            // 如果信誉过低，直接移除
-            if node.is_banned() {
-                warn!("DHT: Node {:?} banned due to low reputation", hex::encode(&id[0..4]));
+            if node.reputation <= REPUTATION_MIN_BAN {
+                warn!("DHT: Banning node {:?} due to low reputation", hex::encode(&id[0..4]));
                 remove_idx = Some(idx);
             }
         }
 
         if let Some(idx) = remove_idx {
             self.nodes.remove(idx);
-            // 晋升备用节点
+            // 尝试从备选池晋升
             if let Some(rep) = self.replacements.pop_back() {
-                // 递归尝试加入，确保留存的也是合法的
-                self.update(rep);
+                self.update(rep, config);
             }
         }
     }
 }
 
 // ============================================================================
-//  内部组件：轻量级存储 (Data Store)
+//  4. 数据存储组件 (离线投递与索引)
 // ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredValue {
     data: Vec<u8>,
     created_at: u64,
-    ttl: u32, // seconds
+    ttl: u32,
 }
 
 impl StoredValue {
@@ -326,30 +309,20 @@ impl StoredValue {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct DhtStorage {
-    // Key -> Value
     map: HashMap<NodeID, StoredValue>,
 }
 
 impl DhtStorage {
-    fn new() -> Self {
-        Self { map: HashMap::new() }
-    }
-
+    fn new() -> Self { Self { map: HashMap::new() } }
+    
     fn put(&mut self, key: NodeID, data: Vec<u8>, ttl: u32) {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let val = StoredValue {
-            data,
-            created_at: now,
-            ttl,
-        };
-        self.map.insert(key, val);
+        self.map.insert(key, StoredValue { data, created_at: now, ttl });
     }
 
     fn get(&self, key: &NodeID) -> Option<Vec<u8>> {
         if let Some(val) = self.map.get(key) {
-            if !val.is_expired() {
-                return Some(val.data.clone());
-            }
+            if !val.is_expired() { return Some(val.data.clone()); }
         }
         None
     }
@@ -362,29 +335,29 @@ impl DhtStorage {
 }
 
 // ============================================================================
-//  主结构：DhtRoutingTable
+//  5. 主结构：DhtRoutingTable (万兆级核心路由器)
 // ============================================================================
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DhtRoutingTable {
     local_id: NodeID,
-    config: DhtConfig,
+    pub config: DhtConfig,
     buckets: Vec<KBucket>,
     storage: DhtStorage,
     
-    // 内存中的黑名单 (IP based)
     #[serde(skip)]
     ip_blacklist: HashSet<IpAddr>,
-    
     #[serde(skip)]
     node_count_cache: usize,
 }
 
 impl DhtRoutingTable {
+    /// 构造函数：基于配置执行全量预分配
     pub fn new(local_id: NodeID, config: DhtConfig) -> Self {
+        let k = config.k_bucket_size;
         let mut buckets = Vec::with_capacity(ID_BITS);
         for _ in 0..ID_BITS {
-            buckets.push(KBucket::new());
+            buckets.push(KBucket::new(k));
         }
         Self {
             local_id,
@@ -396,48 +369,38 @@ impl DhtRoutingTable {
         }
     }
 
-    // --- 基础工具 ---
+    // --- 算法工具 ---
 
     fn bucket_index(&self, target: &NodeID) -> Option<usize> {
         let dist = Distance::xor(&self.local_id, target);
         let zeros = dist.leading_zeros();
-        if zeros >= ID_BITS { return None; } // Self
+        if zeros >= ID_BITS { return None; } // 自己
         Some(ID_BITS - 1 - zeros)
     }
 
     fn is_valid_ip(&self, addr: &SocketAddr) -> bool {
         if self.ip_blacklist.contains(&addr.ip()) { return false; }
         if self.config.allow_bogon_ips { return true; }
-        
         let ip = addr.ip();
-        if ip.is_loopback() || ip.is_multicast() || ip.is_unspecified() {
-            return false;
-        }
-        true
+        !(ip.is_loopback() || ip.is_multicast() || ip.is_unspecified())
     }
 
-    // --- 节点操作 ---
+    // --- 外部接口 ---
 
     pub fn add_node(&mut self, mut node: NodeInfo) -> DhtAddResult {
-        if node.id == self.local_id { return DhtAddResult::Ignored; }
-        if !self.is_valid_ip(&node.addr) { return DhtAddResult::Ignored; }
+        if node.id == self.local_id || !self.is_valid_ip(&node.addr) { 
+            return DhtAddResult::Ignored; 
+        }
 
+        // 虚拟网络映射逻辑
         if self.config.enable_virtual_net && node.virtual_ip.is_none() {
             node.virtual_ip = Some(VirtualNetworkMapper::map_id_to_ip(&node.id));
         }
 
         if let Some(idx) = self.bucket_index(&node.id) {
-            let res = self.buckets[idx].update(node);
-            
-            // 处理更新结果
-            match &res {
-                DhtAddResult::Added | DhtAddResult::Updated => {
-                    self.node_count_cache = self.buckets.iter().map(|b| b.nodes.len()).sum();
-                },
-                DhtAddResult::RejectedSybil => {
-                    // 可选：如果频繁触发，将 IP 加入临时黑名单
-                },
-                _ => {}
+            let res = self.buckets[idx].update(node, &self.config);
+            if matches!(res, DhtAddResult::Added | DhtAddResult::Updated) {
+                self.update_count_cache();
             }
             return res;
         }
@@ -451,24 +414,22 @@ impl DhtRoutingTable {
     }
 
     pub fn mark_failed(&mut self, id: &NodeID) {
+        // 由于 mark_failed 会触发递归 update，需要 clone 配置避免借用冲突
+        let config = self.config.clone();
         if let Some(idx) = self.bucket_index(id) {
-            self.buckets[idx].mark_failed(id);
+            self.buckets[idx].mark_failed(id, &config);
             self.update_count_cache();
         }
     }
 
     pub fn lookup(&self, id: &NodeID) -> Option<NodeInfo> {
-        if let Some(idx) = self.bucket_index(id) {
-            for node in &self.buckets[idx].nodes {
-                if node.id == *id { return Some(node.clone()); }
-            }
-        }
-        None
+        self.bucket_index(id).and_then(|idx| {
+            self.buckets[idx].nodes.iter().find(|n| n.id == *id).cloned()
+        })
     }
 
     pub fn ban_ip(&mut self, ip: IpAddr) {
         self.ip_blacklist.insert(ip);
-        // 清理现有的来自该 IP 的节点
         for bucket in &mut self.buckets {
             bucket.nodes.retain(|n| n.addr.ip() != ip);
             bucket.replacements.retain(|n| n.addr.ip() != ip);
@@ -476,46 +437,34 @@ impl DhtRoutingTable {
         self.update_count_cache();
     }
 
-    // --- 查找逻辑 (K-Nearest) ---
-
+    /// [手段 15] 寻找 K 个最近节点
     pub fn find_closest(&self, target: &NodeID, count: usize) -> Vec<NodeInfo> {
         let mut collected = Vec::new();
         let center_idx = self.bucket_index(target).unwrap_or(0);
         
-        // 迭代器：从中心 Bucket 向两侧扩散
         let mut visited = HashSet::new();
         let mut offset = 0;
 
         while collected.len() < count && visited.len() < ID_BITS {
-            // Check right (+offset)
-            if center_idx + offset < ID_BITS {
-                let idx = center_idx + offset;
-                if visited.insert(idx) {
-                    self.collect_bucket(idx, &mut collected);
-                }
-            }
-            // Check left (-offset)
-            if offset > 0 && center_idx >= offset {
-                let idx = center_idx - offset;
-                if visited.insert(idx) {
-                    self.collect_bucket(idx, &mut collected);
+            for i in &[center_idx as isize + offset, center_idx as isize - offset] {
+                if *i >= 0 && *i < ID_BITS as isize {
+                    let idx = *i as usize;
+                    if visited.insert(idx) {
+                        for node in &self.buckets[idx].nodes {
+                            collected.push(node.clone());
+                        }
+                    }
                 }
             }
             offset += 1;
         }
 
-        // Sort by XOR distance
         collected.sort_by(|a, b| {
             Distance::xor(target, &a.id).cmp(&Distance::xor(target, &b.id))
         });
         
         collected.truncate(count);
         collected
-    }
-
-    fn collect_bucket(&self, idx: usize, out: &mut Vec<NodeInfo>) {
-        let bucket = &self.buckets[idx];
-        for node in &bucket.nodes { out.push(node.clone()); }
     }
 
     pub fn get_random_peers(&self, count: usize) -> Vec<NodeInfo> {
@@ -529,7 +478,7 @@ impl DhtRoutingTable {
         
         if valid_buckets.is_empty() { return vec![]; }
 
-        for _ in 0..count.min(valid_buckets.len() * K_BUCKET_SIZE) {
+        for _ in 0..count.min(valid_buckets.len() * self.config.k_bucket_size) {
             let b_idx = valid_buckets[rng.gen_range(0..valid_buckets.len())];
             let bucket = &self.buckets[b_idx];
             if !bucket.nodes.is_empty() {
@@ -544,7 +493,7 @@ impl DhtRoutingTable {
         all
     }
 
-    // --- 存储操作 ---
+    // --- 数据存储 ---
 
     pub fn store_value(&mut self, key: NodeID, value: Vec<u8>, ttl: u32) {
         self.storage.put(key, value, ttl);
@@ -554,29 +503,22 @@ impl DhtRoutingTable {
         self.storage.get(key)
     }
 
-    // --- 维护逻辑 ---
+    // --- 维护与持久化 ---
 
     pub fn get_refresh_ids(&self) -> Vec<NodeID> {
-        let now = Instant::now();
         let mut targets = Vec::new();
         let mut rng = thread_rng();
 
         for (i, bucket) in self.buckets.iter().enumerate() {
-            if now.duration_since(bucket.last_updated) > self.config.refresh_interval {
-                // Generate random ID in bucket range
+            if bucket.last_updated.elapsed() > self.config.refresh_interval {
                 let mut id = self.local_id;
                 let bit_idx = ID_BITS - 1 - i;
                 let byte_idx = bit_idx / 8;
                 let bit_offset = 7 - (bit_idx % 8);
                 
-                // Flip bit
-                id[byte_idx] ^= 1 << bit_offset;
+                id[byte_idx] ^= 1 << bit_offset; // 翻转位以保证落在该 bucket
                 
-                // Randomize rest
                 for b in (byte_idx + 1)..32 { id[b] = rng.gen(); }
-                let mask = (1 << bit_offset) - 1;
-                id[byte_idx] = (id[byte_idx] & !mask) | (rng.gen::<u8>() & mask);
-                
                 targets.push(id);
             }
         }
@@ -598,12 +540,9 @@ impl DhtRoutingTable {
         stale
     }
 
-    /// 执行垃圾回收 (过期存储、过期节点)
     pub fn perform_gc(&mut self) -> usize {
         self.storage.cleanup()
     }
-
-    // --- 持久化 ---
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let data = bincode::serialize(self)?;
@@ -615,9 +554,7 @@ impl DhtRoutingTable {
     pub fn load(path: &Path) -> Result<Self> {
         let data = fs::read(path)?;
         let mut table: Self = bincode::deserialize(&data)?;
-        // 重置易变状态
-        table.node_count_cache = table.buckets.iter().map(|b| b.nodes.len()).sum();
-        table.ip_blacklist = HashSet::new(); // 黑名单通常不持久化，或单独持久化
+        table.update_count_cache();
         Ok(table)
     }
 
@@ -625,90 +562,197 @@ impl DhtRoutingTable {
         self.node_count_cache
     }
     
-    fn update_count_cache(&mut self) {
-        self.node_count_cache = self.buckets.iter().map(|b| b.nodes.len()).sum();
-    }
-}
-
 // ============================================================================
-//  单元测试
+//  单元测试套件 - 生产级全覆盖版
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::SocketAddrV4;
+    use std::net::SocketAddr;
 
-    fn make_node(id_byte: u8, ip_last: u8) -> NodeInfo {
+    /// 辅助工具：快速创建一个测试用 NodeInfo
+    fn make_test_node(id_byte: u8, ip_str: &str) -> NodeInfo {
         let mut id = [0u8; 32];
-        id[31] = id_byte;
-        let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, ip_last), 8080));
-        NodeInfo::new(id, addr)
+        id[31] = id_byte; // 改变末尾字节以确保落在不同/相同 Bucket
+        NodeInfo::new(id, ip_str.parse().unwrap())
     }
 
+    /// 1. 测试基础路由索引与 XOR 距离
+    #[test]
+    fn test_xor_distance_and_indexing() {
+        let local_id = [0u8; 32];
+        let config = DhtConfig::default();
+        let table = DhtRoutingTable::new(local_id, config);
+
+        // ID 只有最后一位不同，应该落在第 0 个桶 (255 - 0)
+        let mut remote_id = [0u8; 32];
+        remote_id[31] = 1;
+        assert_eq!(table.bucket_index(&remote_id), Some(0));
+
+        // ID 第一位就不同，应该落在最后一个桶 (255 - 255)
+        let mut remote_id_far = [0u8; 32];
+        remote_id_far[0] = 0x80;
+        assert_eq!(table.bucket_index(&remote_id_far), Some(255));
+    }
+
+    /// 2. [手段 15] 测试动态 K 桶容量限制
+    #[test]
+    fn test_dynamic_k_bucket_limit() {
+        let local = [0u8; 32];
+        let mut config = DhtConfig::default();
+        config.k_bucket_size = 3; // 设置极小的 K 桶以便测试
+        let mut table = DhtRoutingTable::new(local, config);
+
+        // 插入 3 个不同子网的节点
+        for i in 1..=3 {
+            let node = make_test_node(i as u8, &format!("1.1.{}.1:8080", i));
+            assert_eq!(table.add_node(node), DhtAddResult::Added);
+        }
+
+        // 插入第 4 个，应触发 BucketFull
+        let node_4 = make_test_node(4, "1.1.4.1:8080");
+        let res = table.add_node(node_4);
+        assert!(matches!(res, DhtAddResult::BucketFull { .. }));
+    }
+
+    /// 3. [手段 15] 测试 IPv4 /24 子网抗女巫防御
     #[test]
     #[cfg(feature = "dht_anti_sybil")]
-    fn test_anti_sybil_protection() {
+    fn test_sybil_defense_ipv4_24() {
         let local = [0u8; 32];
-        let mut table = DhtRoutingTable::new(local, DhtConfig::default());
+        let mut config = DhtConfig::default();
+        config.max_per_ipv4_24 = 2; // 同一 C 段最多 2 个
+        let mut table = DhtRoutingTable::new(local, config);
 
-        // 添加属于同一 Bucket (距离相近) 且同一网段 (192.168.1.x) 的节点
-        // 假设 Bucket 0 是空的，所有这些节点都会落入同一个 Bucket (取决于 local id)
-        // 我们需要构造 ID 使得它们落在同一个 Bucket。
-        // 如果 Local 全 0，ID 以 1 结尾通常落在 Bucket 0.
-        
-        // 1. 添加合法节点 A (192.168.1.10)
-        let res = table.add_node(make_node(1, 10));
-        assert_eq!(res, DhtAddResult::Added);
+        // 前两个来自 192.168.1.x 的节点应允许
+        assert_eq!(table.add_node(make_test_node(1, "192.168.1.10:80")), DhtAddResult::Added);
+        assert_eq!(table.add_node(make_test_node(2, "192.168.1.11:80")), DhtAddResult::Added);
 
-        // 2. 添加合法节点 B (192.168.1.11)
-        let res = table.add_node(make_node(2, 11));
-        assert_eq!(res, DhtAddResult::Added);
-
-        // 3. 添加女巫节点 C (192.168.1.12) -> 此时该网段已有 2 个，应触发拒绝
-        // MAX_PEERS_PER_IPV4_SUBNET = 2
-        let res = table.add_node(make_node(3, 12));
-        assert_eq!(res, DhtAddResult::RejectedSybil);
-
-        // 4. 添加不同网段节点 D (192.168.2.10) -> 应允许
-        let mut node_d = make_node(4, 10);
-        node_d.addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 2, 10)), 8080);
-        let res = table.add_node(node_d);
-        assert_eq!(res, DhtAddResult::Added);
+        // 第三个应被拒绝
+        assert_eq!(table.add_node(make_test_node(3, "192.168.1.12:80")), DhtAddResult::RejectedSybil);
     }
 
+    /// 4. [手段 15] 测试 IPv6 /48 站点级抗女巫防御
     #[test]
-    fn test_reputation_ban() {
+    #[cfg(feature = "dht_anti_sybil")]
+    fn test_sybil_defense_ipv6_48() {
+        let local = [0u8; 32];
+        let mut config = DhtConfig::default();
+        config.max_per_ipv6_48 = 3; // 同一物理站点最多 3 个
+        let mut table = DhtRoutingTable::new(local, config);
+
+        // 模拟来自同一企业网/家庭宽带 /48 段的攻击
+        // 前缀均为 2001:db8:aaaa
+        for i in 1..=3 {
+            let ip = format!("[2001:db8:aaaa:{:x}::1]:80", i);
+            assert_eq!(table.add_node(make_test_node(i as u8, &ip)), DhtAddResult::Added);
+        }
+
+        // 第 4 个应被拦截
+        let ip_4 = "[2001:db8:aaaa:ffff::1]:80";
+        assert_eq!(table.add_node(make_test_node(4, ip_4)), DhtAddResult::RejectedSybil);
+    }
+
+    /// 5. [手段 15] 测试 IPv6 /32 运营商级抗女巫防御
+    #[test]
+    #[cfg(feature = "dht_anti_sybil")]
+    fn test_sybil_defense_ipv6_32() {
+        let local = [0u8; 32];
+        let mut config = DhtConfig::default();
+        config.max_per_ipv6_32 = 2; // 极其严苛的限制，同一 ISP 下只允许 2 个
+        let mut table = DhtRoutingTable::new(local, config);
+
+        // 两个节点来自同一 /32 骨干网段，但不同 /48
+        assert_eq!(table.add_node(make_test_node(1, "[240e:1234:1111::1]:80")), DhtAddResult::Added);
+        assert_eq!(table.add_node(make_test_node(2, "[240e:1234:2222::1]:80")), DhtAddResult::Added);
+
+        // 第三个即便 /48 不同，但在 /32 层面超限，应拒绝
+        assert_eq!(table.add_node(make_test_node(3, "[240e:1234:3333::1]:80")), DhtAddResult::RejectedSybil);
+    }
+
+    /// 6. 测试信誉分自动封禁逻辑
+    #[test]
+    fn test_reputation_auto_ban() {
         let local = [0u8; 32];
         let mut table = DhtRoutingTable::new(local, DhtConfig::default());
         
-        let id = [1u8; 32];
-        let addr = "10.0.0.1:1234".parse().unwrap();
+        let id = [0xEE; 32];
+        let addr = "1.2.3.4:5678".parse().unwrap();
         table.add_node(NodeInfo::new(id, addr));
 
-        // 连续失败，降低信誉
-        for _ in 0..15 {
+        // 模拟节点连续失败
+        // 初始 100 分，每次失败 -10，跌破 -50 (需 16 次左右)
+        for _ in 0..20 {
             table.mark_failed(&id);
         }
 
-        // 检查是否已被移除
+        // 验证节点是否已从路由表中被彻底剔除
         assert!(table.lookup(&id).is_none());
+        
+        // 尝试重新添加该恶意节点，应直接返回 RejectedBanned
+        let res = table.add_node(NodeInfo::new(id, addr));
+        assert_eq!(res, DhtAddResult::RejectedBanned);
     }
 
+    /// 7. 测试存储生命周期与 TTL
     #[test]
-    fn test_storage_ttl() {
+    fn test_storage_and_gc() {
         let local = [0u8; 32];
         let mut table = DhtRoutingTable::new(local, DhtConfig::default());
         
-        let key = [0xAA; 32];
-        table.store_value(key, b"data".to_vec(), 0); // 0 TTL means immediate expire? No, TTL is duration.
-        // Actually our TTL logic: now > created + ttl. 
-        // If ttl=0, now > created (0 latency) is likely true.
+        let key = [0x55; 32];
+        let data = b"DeadDropContent".to_vec();
+
+        // 存储一个 1 秒后过期的值
+        table.store_value(key, data.clone(), 1);
+        assert_eq!(table.get_value(&key), Some(data));
+
+        // 等待过期
+        std::thread::sleep(Duration::from_millis(1100));
         
-        std::thread::sleep(Duration::from_millis(10));
+        // get_value 应返回 None
         assert!(table.get_value(&key).is_none());
         
-        table.store_value(key, b"data2".to_vec(), 10);
-        assert_eq!(table.get_value(&key), Some(b"data2".to_vec()));
+        // 执行 GC
+        let cleaned = table.perform_gc();
+        assert_eq!(cleaned, 1);
+    }
+
+    /// 8. 测试随机节点获取 (用于 Gossip 扩散)
+    #[test]
+    fn test_random_peers_selection() {
+        let local = [0u8; 32];
+        let mut table = DhtRoutingTable::new(local, DhtConfig::default());
+
+        for i in 0..10 {
+            table.add_node(make_test_node(i as u8, &format!("10.0.0.{}:80", i)));
+        }
+
+        let peers = table.get_random_peers(5);
+        assert_eq!(peers.len(), 5);
+        
+        // 验证没有包含自己 (因为 add_node 时已过滤)
+        for p in peers {
+            assert_ne!(p.id, local);
+        }
+    }
+
+    /// 9. 测试持久化 (序列化/反序列化)
+    #[test]
+    fn test_persistence_integrity() {
+        let local = [0x11; 32];
+        let config = DhtConfig::default();
+        let mut table = DhtRoutingTable::new(local, config);
+        
+        table.add_node(make_test_node(0x22, "8.8.8.8:53"));
+        table.store_value([0x33; 32], vec![1, 2, 3], 3600);
+
+        let encoded = bincode::serialize(&table).unwrap();
+        let decoded: DhtRoutingTable = bincode::deserialize(&encoded).unwrap();
+
+        assert_eq!(decoded.local_id, local);
+        assert_eq!(decoded.total_nodes(), 1);
+        assert!(decoded.get_value(&[0x33; 32]).is_some());
     }
 }

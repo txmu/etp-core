@@ -1,6 +1,6 @@
 [package]
 name = "etp-core"
-version = "2.3.3"
+version = "2.3.4"
 edition = "2025"
 authors = ["ETP Core Team"]
 description = "Evolutionary Transport Protocol Core Library"
