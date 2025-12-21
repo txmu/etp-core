@@ -1,6 +1,6 @@
 [package]
 name = "etp-core"
-version = "2.3.4"
+version = "2.3.5"
 edition = "2025"
 authors = ["ETP Core Team"]
 description = "Evolutionary Transport Protocol Core Library"
@@ -10,7 +10,7 @@ crate-type = ["cdylib", "rlib"] # cdylib 用于生成 .so/.dll 给 FFI 使用
 
 [features]
 default = ["full"]
-full = ["ffi", "extensions", "countermeasures", "vpn", "anonymity", "persistence", "dht_anti_sybil", "tns-full"]
+full = ["ffi", "extensions", "countermeasures", "vpn", "anonymity", "persistence", "dht_anti_sybil", "tns-full", "dark-news"]
 
 # --- 核心模块 ---
 ffi = []
@@ -35,6 +35,7 @@ tc15-tcc = [] # 开启 TC-15 虚拟机与 TCC 编译器扩展
 dsl-runtime = ["dep:serde", "dep:serde_json", "dep:nom"]
 evolve-ui = ["tc15-tcc", "dsl-runtime"] # 便捷进化接口特性
 fusion-nexus = ["extensions", "persistence", "anonymity"]
+dark-news = ["persistence", "anonymity", "countermeasures", "tns-reputation", "tc15-tcc", "smart-contracts", "extensions"] # Usenet ETP版
 
 # --- TNS 增强特性集 ---
 # 开启信誉分驱动的 Gossip 转发逻辑 (手段 13/21)

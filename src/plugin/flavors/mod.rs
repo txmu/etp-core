@@ -38,6 +38,8 @@ pub mod signal_drop;
 #[cfg(feature = "fusion-nexus")]
 pub mod fusion_nexus;
 
+#[cfg(feature = "dark-news")]
+pub mod dark_news;
 
 // ============================================================================
 //  统一重新导出关键结构 (方便外部使用)
@@ -54,3 +56,6 @@ pub use tns::TnsFlavor;
 
 #[cfg(feature = "fusion-nexus")]
 pub use fusion_nexus::{FusionNexusFlavor, NexusControlCmd};
+
+#[cfg(feature = "dark-news")]
+pub use dark_news::DarkNewsFlavor;
