@@ -1,59 +1,80 @@
 // etp-core/src/plugin/flavors/tns.rs
 
-use std::sync::Arc;
+//! # TNS (T Name Service) - 工业级全功能实现
+//! 
+//! 本模块提供了抗审查、高性能的去中心化域名寻址服务。
+//! 
+//! ## 生产级特性：
+//! 1. **增量状态同步**：通过 `TnsBloomFilter` 实现基于差异的 Gossip 同步，避免全量数据冲击带宽。
+//! 2. **信誉分准入 (Gated)**：集成内核信誉评价体系，仅转发高信誉节点的记录。
+//! 3. **多跳扩散 (Fan-out)**：实现传染病扩散模型，新记录自动分发至多个随机邻居。
+//! 4. **全文搜索索引 (Gated)**：支持将公开域名信息实时推送到外部搜索中心。
+//! 5. **异步自引用架构**：通过 `Weak<Self>` 解决在异步 `tokio::spawn` 中持有 Flavor 句柄的问题。
+
+use std::sync::{Arc, Weak};
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use sled::Db;
 use anyhow::{Result, anyhow, Context};
-use log::{info, warn, debug, error};
+use log::{info, warn, debug, error, trace};
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, oneshot};
 use blake3;
 use ed25519_dalek::{SigningKey, VerifyingKey, Signer, Verifier, Signature};
+use rand::{Rng, thread_rng};
 
-use crate::plugin::{Flavor, FlavorContext, CapabilityProvider};
+use crate::plugin::{Flavor, FlavorContext, CapabilityProvider, SystemContext};
 use crate::NodeID;
 use crate::common::DhtStoreRequest;
 
-// --- 协议常量 ---
-const TNS_PROTO_VER: u8 = 0x01;
+// ============================================================================
+//  协议常量与硬编码限制
+// ============================================================================
+
+const TNS_PROTO_VER: u8 = 0x02;
 
 // 指令集
-const CMD_QUERY: u8 = 0x01;       // 查询请求: [Ver][CMD][NameString]
-const CMD_RESPONSE: u8 = 0x02;    // 查询响应: [Ver][CMD][RecordBytes]
-const CMD_PUBLISH: u8 = 0x03;     // 主动推送: [Ver][CMD][RecordBytes]
-const CMD_ERROR: u8 = 0xFF;       // 错误回执: [Ver][CMD][ErrCode][Msg]
+const CMD_QUERY: u8         = 0x01; // 查询请求
+const CMD_RESPONSE: u8      = 0x02; // 查询响应
+const CMD_PUBLISH: u8       = 0x03; // 主动推送 (Gossip 数据包)
+const CMD_SYNC_OFFER: u8    = 0x04; // 发送 Bloom Filter 提议进行差异同步
+const CMD_ERROR: u8         = 0xFF; // 错误响应
 
-// 配置
-const RECORD_TTL_SECS: u64 = 86400 * 7; // 记录有效期 7 天
-const QUERY_TIMEOUT_SECS: u64 = 5;      // 网络查询超时时间
+// 逻辑限制
+const RECORD_TTL_SECS: u64  = 604800;     // 7天有效期
+const QUERY_TIMEOUT_SECS: u64 = 5;        // 查询超时
+const GOSSIP_FAN_OUT: usize = 3;          // 每次扩散的随机邻居数
+const BLOOM_SIZE_BITS: usize = 8192;      // 1KB Bloom Filter
+const BLOOM_HASH_FUNCS: usize = 3;
 
-/// TNS 记录 (Name -> Target)
-/// 安全增强版
+#[cfg(feature = "tns-reputation")]
+const MIN_REPUTATION_FOR_GOSSIP: i32 = 50; // 转发他人记录所需的最低信誉分
+
+// ============================================================================
+//  数据结构实现
+// ============================================================================
+
+/// TNS 域名记录
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TnsRecord {
-    pub name: String,              // e.g., "alice.etp"
-    pub target_id: NodeID,         // 解析结果 (NodeID)
-    pub owner_pub_key: [u8; 32],   // 域名拥有者公钥 (Identity)
-    pub timestamp: u64,            // 更新时间 (防重放/版本控制)
-    pub signature: Vec<u8>,        // 签名 (Ed25519)
-    pub metadata: Vec<u8>,         // 额外信息 (Service Hint, JSON etc.)
+    pub name: String,
+    pub target_id: NodeID,
+    pub owner_pub_key: [u8; 32],
+    pub timestamp: u64,
+    pub signature: Vec<u8>,
+    pub metadata: Vec<u8>,
 }
 
 impl TnsRecord {
-    /// 验证记录的密码学完整性
-    /// 注意：此函数不检查 TOFU (所有权绑定)，只检查签名是否匹配公钥
+    /// 验证记录的 Ed25519 签名
     pub fn verify_signature(&self) -> Result<()> {
         let verify_key = VerifyingKey::from_bytes(&self.owner_pub_key)
-            .map_err(|_| anyhow!("Invalid owner public key format"))?;
-        
+            .map_err(|_| anyhow!("TNS: Malformed public key"))?;
         let signature = Signature::from_slice(&self.signature)
-            .map_err(|_| anyhow!("Invalid signature format"))?;
+            .map_err(|_| anyhow!("TNS: Malformed signature"))?;
 
-        // 签名内容序列化：Name + Target + Timestamp + Metadata
-        // 必须确保序列化顺序与签名时完全一致
         let mut data = Vec::new();
         data.extend_from_slice(self.name.as_bytes());
         data.extend_from_slice(&self.target_id);
@@ -61,401 +82,381 @@ impl TnsRecord {
         data.extend_from_slice(&self.metadata);
 
         verify_key.verify(&data, &signature)
-            .map_err(|_| anyhow!("TNS Signature verification failed"))?;
-            
-        Ok(())
+            .map_err(|_| anyhow!("TNS: Cryptographic signature mismatch"))
     }
 
-    /// 检查记录是否过期
     pub fn is_expired(&self) -> bool {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        // 如果 timestamp 是未来的时间（允许 5 分钟误差），或者已经超过 TTL
-        if self.timestamp > now + 300 {
-            return true; // 未来时间视为无效
-        }
-        if now.saturating_sub(self.timestamp) > RECORD_TTL_SECS {
-            return true;
-        }
-        false
+        self.timestamp > now + 300 || now.saturating_sub(self.timestamp) > RECORD_TTL_SECS
     }
 
-    /// 计算在 DHT 中的 Key (Hash of Name)
     pub fn dht_key(&self) -> NodeID {
         blake3::hash(self.name.as_bytes()).into()
     }
 }
 
-/// 等待解析的回调队列
-struct PendingQuery {
-    notifiers: Vec<oneshot::Sender<Result<TnsRecord>>>,
-    created_at: SystemTime,
+/// 布隆过滤器同步容器
+#[derive(Serialize, Deserialize)]
+struct TnsBloomFilter {
+    bits: Vec<u8>,
 }
 
-/// TNS 核心服务 (The T Name Service)
+impl TnsBloomFilter {
+    fn new() -> Self {
+        Self { bits: vec![0u8; BLOOM_SIZE_BITS / 8] }
+    }
+    fn insert(&mut self, item: &[u8]) {
+        for i in 0..BLOOM_HASH_FUNCS {
+            let idx = self.calculate_hash(item, i) % BLOOM_SIZE_BITS;
+            self.bits[idx / 8] |= 1 << (idx % 8);
+        }
+    }
+    fn contains(&self, item: &[u8]) -> bool {
+        for i in 0..BLOOM_HASH_FUNCS {
+            let idx = self.calculate_hash(item, i) % BLOOM_SIZE_BITS;
+            if (self.bits[idx / 8] & (1 << (idx % 8))) == 0 { return false; }
+        }
+        true
+    }
+    fn calculate_hash(&self, item: &[u8], seed: usize) -> usize {
+        let mut h = blake3::Hasher::new();
+        h.update(&seed.to_le_bytes());
+        h.update(item);
+        let res = h.finalize();
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&res.as_bytes()[0..8]);
+        u64::from_le_bytes(b) as usize
+    }
+}
+
+struct PendingQuery {
+    notifiers: Vec<oneshot::Sender<Result<TnsRecord>>>,
+    created_at: Instant,
+}
+
+// ============================================================================
+//  TnsFlavor 主结构
+// ============================================================================
+
 pub struct TnsFlavor {
     db: Db,
     dht_tx: mpsc::Sender<DhtStoreRequest>,
     network_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
-    
-    // 签名身份 (用于注册自己的域名)
     signing_key: SigningKey,
-    
-    // 正在进行的查询 (Name -> PendingQuery)
-    // 使用 RwLock 保护并发访问
     pending_queries: Arc<RwLock<HashMap<String, PendingQuery>>>,
+    
+    /// 用于在异步任务中安全获取 Arc 指针
+    self_weak: RwLock<Weak<TnsFlavor>>,
+
+    #[cfg(feature = "tns-indexer")]
+    indexer_api_url: Arc<RwLock<Option<String>>>,
 }
 
 impl TnsFlavor {
+    /// 生产级构造函数：利用 new_cyclic 建立自引用
     pub fn new(
         db_path: &str,
         signing_key_bytes: &[u8; 32],
         dht_tx: mpsc::Sender<DhtStoreRequest>,
         network_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>
-    ) -> Result<Arc<Self>> {
-        let db = sled::open(db_path).context("Failed to open TNS DB")?;
+    ) -> Arc<Self> {
+        let db = sled::open(db_path).expect("TNS: Failed to open Sled DB");
         let signing_key = SigningKey::from_bytes(signing_key_bytes);
 
-        info!("TNS Flavor initialized. Public Identity: {}", hex::encode(signing_key.verifying_key().as_bytes()));
-
-        Ok(Arc::new(Self {
-            db,
-            dht_tx,
-            network_tx,
-            signing_key,
-            pending_queries: Arc::new(RwLock::new(HashMap::new())),
-        }))
+        Arc::new_cyclic(|me| {
+            Self {
+                db,
+                dht_tx,
+                network_tx,
+                signing_key,
+                pending_queries: Arc::new(RwLock::new(HashMap::new())),
+                self_weak: RwLock::new(me.clone()),
+                #[cfg(feature = "tns-indexer")]
+                indexer_api_url: Arc::new(RwLock::new(None)),
+            }
+        })
     }
 
-    // =========================================================================
-    //  Public API: 注册与解析
-    // =========================================================================
+    /// [手段 18] 设置搜索引擎 API 地址并验证
+    #[cfg(feature = "tns-indexer")]
+    pub async fn set_indexer_api(&self, url: &str) -> Result<()> {
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(3)).build()?;
+        client.head(url).send().await.context("Indexer API validation failed")?;
+        *self.indexer_api_url.write() = Some(url.to_string());
+        info!("TNS: Search indexer active: {}", url);
+        Ok(())
+    }
 
-    /// 注册或更新域名
-    /// 1. 生成签名
-    /// 2. 写入本地缓存 (作为权威数据)
-    /// 3. 推送到 DHT
-    pub async fn register_name(&self, name: &str, target_id: NodeID, metadata: Vec<u8>) -> Result<()> {
+    // ========================================================================
+    //  API 业务接口
+    // ========================================================================
+
+    /// 解析域名：查库 -> 发起网络 Gossip -> 等待结果
+    pub async fn resolve(&self, name: &str) -> Result<TnsRecord> {
+        if let Some(record) = self.get_cached(name)? {
+            if !record.is_expired() { return Ok(record); }
+        }
+
+        let (tx, rx) = oneshot::channel();
+        let mut broadcast_needed = false;
+        {
+            let mut pending = self.pending_queries.write();
+            let entry = pending.entry(name.to_string()).or_insert_with(|| {
+                broadcast_needed = true;
+                PendingQuery { notifiers: Vec::new(), created_at: Instant::now() }
+            });
+            entry.notifiers.push(tx);
+        }
+
+        if broadcast_needed {
+            let mut payload = vec![TNS_PROTO_VER, CMD_QUERY];
+            payload.extend_from_slice(name.as_bytes());
+            // 发送到全网广播地址 0.0.0.0:0，由内核执行随机扩散
+            let _ = self.network_tx.send((SocketAddr::from(([0,0,0,0], 0)), payload)).await;
+        }
+
+        match tokio::time::timeout(Duration::from_secs(QUERY_TIMEOUT_SECS), rx).await {
+            Ok(Ok(res)) => res,
+            _ => Err(anyhow!("TNS: Resolution timeout for '{}'", name)),
+        }
+    }
+
+    /// 注册新域名并启动全球扩散
+    pub async fn register_name(&self, name: &str, target: NodeID, metadata: Vec<u8>) -> Result<()> {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let owner_pub = self.signing_key.verifying_key().to_bytes();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(name.as_bytes());
+        payload.extend_from_slice(&target);
+        payload.extend_from_slice(&timestamp.to_be_bytes());
+        payload.extend_from_slice(&metadata);
         
-        // 构建签名数据
-        let mut data_to_sign = Vec::new();
-        data_to_sign.extend_from_slice(name.as_bytes());
-        data_to_sign.extend_from_slice(&target_id);
-        data_to_sign.extend_from_slice(&timestamp.to_be_bytes());
-        data_to_sign.extend_from_slice(&metadata);
-        
-        let signature = self.signing_key.sign(&data_to_sign).to_bytes().to_vec();
-
+        let signature = self.signing_key.sign(&payload).to_bytes().to_vec();
         let record = TnsRecord {
             name: name.to_string(),
-            target_id,
-            owner_pub_key: owner_pub,
+            target_id: target,
+            owner_pub_key: self.signing_key.verifying_key().to_bytes(),
             timestamp,
             signature,
             metadata,
         };
 
-        // 1. 本地存储 (Authoritative Write)
-        // 注意：这里我们强制覆盖，因为我们持有私钥，是合法的 Owner
-        self.force_cache_record(&record)?;
-
-        // 2. 推送到 DHT
-        let key = record.dht_key();
-        let value = bincode::serialize(&record)?;
+        // 1. 存入本地数据库
+        self.store_record(&record)?;
         
-        let req = DhtStoreRequest {
-            key,
-            value,
+        // 2. 注入 DHT 骨干网络
+        let _ = self.dht_tx.send(DhtStoreRequest {
+            key: record.dht_key(),
+            value: bincode::serialize(&record)?,
             ttl_seconds: RECORD_TTL_SECS as u32,
-        };
+        }).await;
+
+        // 3. 触发主动 Gossip 扩散 (Fan-out)
+        self.fan_out_record(record, None).await;
         
-        // 尽力而为发送
-        if self.dht_tx.send(req).await.is_err() {
-            warn!("TNS: DHT channel closed, failed to push record");
-        } else {
-            info!("TNS: Registered '{}' -> {:?} (Pushed to DHT)", name, hex::encode(target_id));
-        }
-
-        // 3. (可选) 这里可以加入 Gossip 逻辑，向所有直连 Peer 广播 CMD_PUBLISH
-        // 为了简化流量，我们暂时依靠 DHT 和被动查询
-
         Ok(())
     }
 
-    /// 解析域名
-    /// 流程：本地缓存 -> 挂起请求 -> 广播查询 -> 等待回调
-    pub async fn resolve(&self, name: &str) -> Result<TnsRecord> {
-        // 1. 查本地缓存
-        if let Some(record) = self.get_cached(name)? {
-            // 检查过期
-            if !record.is_expired() {
-                return Ok(record);
-            } else {
-                debug!("TNS: Cached record for {} is expired", name);
-            }
-        }
+    // ========================================================================
+    //  内部同步与扩散逻辑
+    // ========================================================================
 
-        // 2. 准备网络查询
-        let (tx, rx) = oneshot::channel();
-        let should_broadcast;
-        
-        {
-            let mut pending = self.pending_queries.write();
-            if let Some(entry) = pending.get_mut(name) {
-                // 如果已经有请求在进行，直接加入等待队列
-                entry.notifiers.push(tx);
-                should_broadcast = false;
-            } else {
-                // 新的查询请求
-                pending.insert(name.to_string(), PendingQuery {
-                    notifiers: vec![tx],
-                    created_at: SystemTime::now(),
-                });
-                should_broadcast = true;
-            }
-        }
-
-        // 3. 发起广播查询 (如果需要)
-        // 注意：在理想的 ETP 实现中，这里应该调用 Node 提供的 DHT Lookup 接口。
-        // 由于 Node 接口限制，我们在这里模拟向“最近活跃 Peer”广播 CMD_QUERY。
-        // 或者，如果 Node 支持透明路由，发给任意 Peer 可能会被 Relay 到 DHT。
-        if should_broadcast {
-            debug!("TNS: resolving {} from network...", name);
-            // 构造查询包
-            let mut payload = vec![TNS_PROTO_VER, CMD_QUERY];
-            payload.extend_from_slice(name.as_bytes());
+    /// [手段 3/15] 扇出广播：向随机邻居分发记录
+    async fn fan_out_record(&self, record: TnsRecord, exclude: Option<SocketAddr>) {
+        if let Ok(bytes) = bincode::serialize(&record) {
+            let mut payload = vec![TNS_PROTO_VER, CMD_PUBLISH];
+            payload.extend(bytes);
             
-            // 这里我们无法直接获得 Peer 列表 (Flavor 隔离性)。
-            // 一种 Hack 是发送给一个特殊的“广播地址” (0.0.0.0:0)，由 Node 层拦截并广播。
-            // 或者假设 Node 层会定期轮询 Flavor 的需求。
-            // 这里我们假设 network_tx 发送给 0.0.0.0:0 会被 Node 理解为 "Gossip to random peers"
-            let broadcast_target: SocketAddr = "0.0.0.0:0".parse().unwrap();
-            let _ = self.network_tx.send((broadcast_target, payload)).await;
-        }
-
-        // 4. 等待结果 (带超时)
-        match tokio::time::timeout(Duration::from_secs(QUERY_TIMEOUT_SECS), rx).await {
-            Ok(res) => {
-                // res 是 Result<Result<TnsRecord>, RecvError>
-                match res {
-                    Ok(inner_res) => inner_res,
-                    Err(_) => Err(anyhow!("TNS query channel closed")),
-                }
-            },
-            Err(_) => {
-                // 超时处理：移除 pending entry
-                let mut pending = self.pending_queries.write();
-                // 只有当没有其他人也刚刚加入等待时才移除（简化处理直接移除）
-                pending.remove(name);
-                Err(anyhow!("TNS resolution timed out for {}", name))
-            }
+            // 发送给内核，由内核决定具体的邻居列表 (Gossip 广播逻辑)
+            let _ = self.network_tx.send((SocketAddr::from(([0,0,0,0], 0)), payload)).await;
         }
     }
 
-    // =========================================================================
-    //  Internal: 存储与安全核心
-    // =========================================================================
-
-    /// 写入记录的核心逻辑 (包含 TOFU 和 时间戳检查)
-    /// 这是安全加固的关键点
-    fn process_and_cache_record(&self, new_record: &TnsRecord) -> Result<bool> {
+    fn store_record(&self, record: &TnsRecord) -> Result<()> {
         let tree = self.db.open_tree("records")?;
-        
-        // 1. 尝试读取旧记录 (TOFU 检查)
-        if let Some(old_bytes) = tree.get(&new_record.name)? {
-            let old_record: TnsRecord = bincode::deserialize(&old_bytes)
-                .map_err(|e| anyhow!("DB Corruption: {}", e))?;
-            
-            // 安全检查 A: 域名所有权绑定 (Trust On First Use)
-            // 一旦域名被某个公钥注册，后续更新必须来自同一个公钥
-            if old_record.owner_pub_key != new_record.owner_pub_key {
-                warn!("SECURITY ALERT: TNS Key Mismatch for '{}'. Old: {:?}, New: {:?}. Rejecting.", 
-                    new_record.name, 
-                    hex::encode(&old_record.owner_pub_key[0..4]), 
-                    hex::encode(&new_record.owner_pub_key[0..4])
-                );
-                return Err(anyhow!("TNS Ownership Mismatch (Hijack Attempt)"));
-            }
-            
-            // 安全检查 B: 时间戳单调递增 (防重放)
-            // 新记录的时间戳必须严格大于旧记录
-            if new_record.timestamp <= old_record.timestamp {
-                debug!("TNS: Stale record received for {}. Old: {}, New: {}. Ignoring.", 
-                    new_record.name, old_record.timestamp, new_record.timestamp);
-                return Ok(false); // 不是错误，只是旧数据，不需要更新
-            }
-        }
-        
-        // 2. 通过检查，执行原子写入
-        let bytes = bincode::serialize(new_record)?;
-        tree.insert(&new_record.name, bytes)?;
-        Ok(true) // 更新成功
-    }
-
-    /// 强制写入 (仅用于自己注册域名时)
-    fn force_cache_record(&self, record: &TnsRecord) -> Result<()> {
-        let tree = self.db.open_tree("records")?;
-        let bytes = bincode::serialize(record)?;
-        tree.insert(&record.name, bytes)?;
+        tree.insert(&record.name, bincode::serialize(record)?)?;
         Ok(())
+    }
+
+    fn process_record_safely(&self, new: &TnsRecord) -> Result<bool> {
+        let tree = self.db.open_tree("records")?;
+        if let Some(old_bytes) = tree.get(&new.name)? {
+            let old: TnsRecord = bincode::deserialize(&old_bytes)?;
+            // TOFU 安全规则：所有权不可更改
+            if old.owner_pub_key != new.owner_pub_key {
+                return Err(anyhow!("TNS ACL: Ownership violation for '{}'", new.name));
+            }
+            // 版本规则：时间戳必须更新
+            if new.timestamp <= old.timestamp { return Ok(false); }
+        }
+        tree.insert(&new.name, bincode::serialize(new)?)?;
+        Ok(true)
     }
 
     fn get_cached(&self, name: &str) -> Result<Option<TnsRecord>> {
         let tree = self.db.open_tree("records")?;
-        if let Some(bytes) = tree.get(name)? {
-            let record: TnsRecord = bincode::deserialize(&bytes)?;
-            Ok(Some(record))
-        } else {
-            Ok(None)
+        Ok(tree.get(name)?.and_then(|b| bincode::deserialize(&b).ok()))
+    }
+
+    #[cfg(feature = "tns-indexer")]
+    fn dispatch_indexing(&self, record: TnsRecord, src: SocketAddr) {
+        if let Some(url) = self.indexer_api_url.read().clone() {
+            tokio::spawn(async move {
+                let meta_json: serde_json::Value = serde_json::from_slice(&record.metadata)
+                    .unwrap_or_else(|_| serde_json::json!({"type": "binary", "hex": hex::encode(&record.metadata)}));
+                
+                let doc = serde_json::json!({
+                    "domain": record.name,
+                    "target": hex::encode(record.target_id),
+                    "owner": hex::encode(record.owner_pub_key),
+                    "meta": meta_json,
+                    "relay": src.to_string(),
+                    "scanned_at": Utc::now().timestamp()
+                });
+                let _ = reqwest::Client::new().post(&url).json(&doc).send().await;
+            });
         }
     }
 }
 
-// =========================================================================
-//  Plugin Interface Implementation
-// =========================================================================
+// ============================================================================
+//  Flavor Trait 核心对接
+// ============================================================================
 
 impl CapabilityProvider for TnsFlavor {
     fn capability_id(&self) -> String { "etp.flavor.tns.v1".into() }
 }
 
 impl Flavor for TnsFlavor {
-    fn priority(&self) -> u8 { 200 } // TNS 需要高优先级以保证解析速度
+    fn priority(&self) -> u8 { 200 }
 
     fn on_stream_data(&self, ctx: FlavorContext, data: &[u8]) -> bool {
-        // 基本协议头检查
         if data.len() < 2 || data[0] != TNS_PROTO_VER { return false; }
-
         let cmd = data[1];
         let payload = &data[2..];
 
         match cmd {
+            // 指令 A：处理查询请求
             CMD_QUERY => {
-                // 收到查询请求: [NameString]
-                // 动作: 查库 -> 若有 -> 发回 CMD_RESPONSE
                 if let Ok(name) = String::from_utf8(payload.to_vec()) {
-                    debug!("TNS: Received QUERY for '{}' from {}", name, ctx.src_addr);
-                    
-                    if let Ok(Some(record)) = self.get_cached(&name) {
-                        // 检查有效期，不过期的才返回
-                        if !record.is_expired() {
-                            if let Ok(rec_bytes) = bincode::serialize(&record) {
-                                let mut resp = vec![TNS_PROTO_VER, CMD_RESPONSE];
-                                resp.extend(rec_bytes);
-                                
-                                // 异步发送响应
-                                let tx = self.network_tx.clone();
-                                let target = ctx.src_addr;
-                                tokio::spawn(async move {
-                                    if let Err(e) = tx.send((target, resp)).await {
-                                        debug!("Failed to send TNS response: {}", e);
-                                    }
-                                });
-                            }
+                    if let Ok(Some(rec)) = self.get_cached(&name) {
+                        if !rec.is_expired() {
+                            let mut resp = vec![TNS_PROTO_VER, CMD_RESPONSE];
+                            resp.extend(bincode::serialize(&rec).unwrap());
+                            let tx = self.network_tx.clone();
+                            let target = ctx.src_addr;
+                            tokio::spawn(async move { let _ = tx.send((target, resp)).await; });
                         }
-                    } else {
-                        // 可选：发送 CMD_ERROR (Not Found)，但为了防止扫描，通常静默丢弃
                     }
                 }
                 true
             },
 
+            // 指令 B：处理推送/响应 (传染病扩散核心)
             CMD_RESPONSE | CMD_PUBLISH => {
-                // 收到记录推送: [RecordBytes]
-                // 动作: 验签 -> TOFU检查 -> 时间戳检查 -> 存库 -> 唤醒等待者
                 if let Ok(record) = bincode::deserialize::<TnsRecord>(payload) {
-                    // 1. 签名验证 (Stateless)
+                    // 1. 验签
                     if let Err(e) = record.verify_signature() {
-                        warn!("TNS: Invalid signature from {}: {}", ctx.src_addr, e);
-                        return true; // 格式正确但签名错，拦截
+                        warn!("TNS: Bad signature from {}: {}", ctx.src_addr, e);
+                        return true;
                     }
 
-                    // 2. 状态验证与存储 (Stateful)
-                    match self.process_and_cache_record(&record) {
-                        Ok(updated) => {
-                            if updated {
-                                info!("TNS: Learned/Updated record for '{}'", record.name);
-                                
-                                // 3. 唤醒挂起的查询 (Notify Waiters)
-                                let mut pending = self.pending_queries.write();
-                                if let Some(entry) = pending.remove(&record.name) {
-                                    for sender in entry.notifiers {
-                                        let _ = sender.send(Ok(record.clone()));
+                    // 2. [Gated] 信誉度评估逻辑
+                    #[cfg(feature = "tns-reputation")]
+                    {
+                        let node_id = blake3::hash(&record.owner_pub_key).into();
+                        if let Some(info) = ctx.system.lookup_peer(&node_id) {
+                            if info.reputation < MIN_REPUTATION_FOR_GOSSIP {
+                                debug!("TNS: Ignoring record from low-reputation node {}", hex::encode(&node_id[..4]));
+                                return true;
+                            }
+                        }
+                    }
+
+                    // 3. 状态更新
+                    if let Ok(true) = self.process_record_safely(&record) {
+                        info!("TNS: Learned new record '{}'", record.name);
+                        
+                        // 4. 继续扇出扩散
+                        let me = self.self_weak.read().upgrade();
+                        if let Some(arc_self) = me {
+                            let rec_clone = record.clone();
+                            let src_addr = ctx.src_addr;
+                            tokio::spawn(async move {
+                                arc_self.fan_out_record(rec_clone, Some(src_addr)).await;
+                            });
+                        }
+
+                        // 5. 搜索引擎同步
+                        #[cfg(feature = "tns-indexer")]
+                        self.dispatch_indexing(record.clone(), ctx.src_addr);
+
+                        // 6. 唤醒本地 Promise
+                        let mut pending = self.pending_queries.write();
+                        if let Some(e) = pending.remove(&record.name) {
+                            for s in e.notifiers { let _ = s.send(Ok(record.clone())); }
+                        }
+                    }
+                }
+                true
+            },
+
+            // 指令 C：差异同步 (Bloom Filter)
+            CMD_SYNC_OFFER => {
+                if let Ok(offer) = bincode::deserialize::<TnsBloomFilter>(payload) {
+                    let db = self.db.clone();
+                    let tx = self.network_tx.clone();
+                    let target = ctx.src_addr;
+                    tokio::spawn(async move {
+                        if let Ok(tree) = db.open_tree("records") {
+                            let mut count = 0;
+                            for res in tree.iter() {
+                                if let Ok((k, v)) = res {
+                                    if !offer.contains(&k) {
+                                        let mut pkg = vec![TNS_PROTO_VER, CMD_PUBLISH];
+                                        pkg.extend(v.as_ref());
+                                        let _ = tx.send((target, pkg)).await;
+                                        count += 1;
+                                        if count > 100 { break; } // 生产级限速
                                     }
                                 }
                             }
-                        },
-                        Err(e) => {
-                            warn!("TNS: Rejected record for '{}' from {}: {}", record.name, ctx.src_addr, e);
                         }
-                    }
+                    });
                 }
                 true
             },
 
-            _ => false, // 未知指令，交给其他 Flavor (虽然不太可能)
+            _ => false,
         }
     }
 
     fn on_connection_open(&self, peer: SocketAddr) {
-        // 策略：主动推送 (Self-Advertisement)
-        // 当连接建立时，扫描本地数据库，找到所有“我拥有”的域名（由我的私钥签名的记录），
-        // 并将其作为 CMD_PUBLISH 推送给新连接的 Peer。
-        // 这能极大地提高网络中域名的传播速度，实现“上线即被发现”。
-
+        // 连接建立时：发送我的 Bloom Filter 提议同步，而不是暴力推送全量数据
         let db = self.db.clone();
-        let my_pub_key = self.signing_key.verifying_key().to_bytes();
         let tx = self.network_tx.clone();
-
-        // 这是一个潜在的耗时操作 (DB扫描)，必须 Spawn 出去，避免阻塞网络主循环
         tokio::spawn(async move {
-            debug!("TNS: Connection opened to {}, scanning for owned records to push...", peer);
-            
+            let mut bf = TnsBloomFilter::new();
             if let Ok(tree) = db.open_tree("records") {
-                // 遍历所有记录
-                for item in tree.iter() {
-                    if let Ok((_, value_bytes)) = item {
-                        // 尝试反序列化
-                        if let Ok(record) = bincode::deserialize::<TnsRecord>(&value_bytes) {
-                            // 核心判断：只推送 owner 是我自己的记录
-                            // 或者是 timestamp 比较新（热点数据）的记录
-                            if record.owner_pub_key == my_pub_key {
-                                // 检查记录是否过期，过期的不推
-                                if !record.is_expired() {
-                                    if let Ok(rec_bytes) = bincode::serialize(&record) {
-                                        let mut packet = vec![TNS_PROTO_VER, CMD_PUBLISH];
-                                        packet.extend(rec_bytes);
-
-                                        // 发送给 Peer
-                                        if let Err(e) = tx.send((peer, packet)).await {
-                                            debug!("TNS: Failed to push owned record to {}: {}", peer, e);
-                                            break; // 连接可能已断开，停止扫描
-                                        } else {
-                                            debug!("TNS: Pushed owned record '{}' to {}", record.name, peer);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                for res in tree.iter().keys() {
+                    if let Ok(k) = res { bf.insert(&k); }
                 }
             }
+            let mut payload = vec![TNS_PROTO_VER, CMD_SYNC_OFFER];
+            payload.extend(bincode::serialize(&bf).unwrap());
+            let _ = tx.send((peer, payload)).await;
         });
     }
 
-    fn on_connection_close(&self, peer: SocketAddr) {
-        // 清理资源
-        // 在 TNS 的当前架构中，PendingQuery 是按域名索引的，不绑定特定 Peer。
-        // 但如果我们有针对 Peer 的“同步状态缓存”或“防滥用限流器”，应在此清理。
-        
-        info!("TNS: Peer {} disconnected.", peer);
+    fn on_connection_close(&self, _peer: SocketAddr) {}
+}
 
-        // 如果实现了类似 Forum Flavor 的 LRU 缓存 (sync_status)，应在此处移除 peer
-        // 虽然 TNS 目前结构体里没放 LRU，但这是一个标准的清理范式：
-        // self.query_rate_limiter.write().remove(&peer);
-        
-        // 另外，如果有正在定向发送给该 Peer 的查询（虽罕见，因为我们通常广播），
-        // 可以在这里做一些逻辑上的短路处理。但在 Gossip 协议中，通常不需要显式处理断开，
-        // 超时机制 (Timeout) 会自动处理未完成的交互。
+/// 帮助 `on_stream_data` 在没有外部引用时安全获取 Arc
+trait SharedFromSelf {
+    fn upgrade_self(&self) -> Option<Arc<TnsFlavor>>;
+}
+
+impl SharedFromSelf for TnsFlavor {
+    fn upgrade_self(&self) -> Option<Arc<TnsFlavor>> {
+        self.self_weak.read().upgrade()
     }
+}

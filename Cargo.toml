@@ -1,7 +1,7 @@
 [package]
 name = "etp-core"
-version = "2.1.1"
-edition = "2021"
+version = "2.3.3"
+edition = "2025"
 authors = ["ETP Core Team"]
 description = "Evolutionary Transport Protocol Core Library"
 
@@ -10,11 +10,11 @@ crate-type = ["cdylib", "rlib"] # cdylib 用于生成 .so/.dll 给 FFI 使用
 
 [features]
 default = ["full"]
-full = ["ffi", "extensions", "countermeasures", "vpn", "anonymity", "persistence", "dht_anti_sybil"]
+full = ["ffi", "extensions", "countermeasures", "vpn", "anonymity", "persistence", "dht_anti_sybil", "tns-full"]
 
 # --- 核心模块 ---
 ffi = []
-extensions = ["notify", "reqwest", "serde_yaml", "toml", "rust-ini", "serde-xml-rs", "url", "regex", "dep:flate2"]
+extensions = ["notify", "reqwest", "serde_yaml", "toml", "rust-ini", "serde-xml-rs", "url", "regex", "dep:flate2", "tokio-util"]
 countermeasures = []
 vpn = ["tun"]
 anonymity = ["tokio-util"]
@@ -34,6 +34,18 @@ safefs = ["dep:argon2", "dep:memmap2", "dep:users", "dep:nix"]
 tc15-tcc = [] # 开启 TC-15 虚拟机与 TCC 编译器扩展
 dsl-runtime = ["dep:serde", "dep:serde_json", "dep:nom"]
 evolve-ui = ["tc15-tcc", "dsl-runtime"] # 便捷进化接口特性
+fusion-nexus = ["extensions", "persistence", "anonymity"]
+
+# --- TNS 增强特性集 ---
+# 开启信誉分驱动的 Gossip 转发逻辑 (手段 13/21)
+tns-reputation = [] 
+
+# 开启搜索引擎索引支持 (爬虫化)
+# 依赖 reqwest 模块进行 API 转发
+tns-indexer = ["dep:reqwest", "dep:serde_json"]
+
+# 定义全功能 TNS 捆绑包
+tns-full = ["persistence", "tns-reputation", "tns-indexer"]
 
 # --- 语言绑定支持 (Super Support Features) ---
 # 开启对应的 feature 会引入特定语言的胶水库
@@ -163,8 +175,6 @@ pqcrypto-traits = { version = "0.3", optional = true }
 # 偏执模式 (paranoid-security): 彻底物理擦除数据，增加 O(N) 的内存写操作。对于 10Gbps+ 的高吞吐场景会有可见的 CPU 占用提升，但在密钥协商和钱包签名等低频高敏场景下完全可忽略。好处是即使发生 Panic 导致 Core Dump，或者利用 unsafe 代码越界读取 Pool 中的缓存，攻击者也只能读到全 0 数据。
 zeroize = { version = "1.7", optional = true }
 
-# --- Optional: Anonymity Module ---
-# 用于 Tor/I2P 的 SOCKS5 握手和 TCP 封包处理
 tokio-util = { version = "0.7", features = ["codec"], optional = true } 
 
 # --- Optional: ENS Gateway Dependencies---

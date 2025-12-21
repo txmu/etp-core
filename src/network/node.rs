@@ -1465,6 +1465,18 @@ impl EtpEngine {
     }
 
     async fn handle_tick(&self) {
+        // 1. 每秒执行一次 Token 清理和时间同步
+        #[cfg(feature = "xdp")]
+        {
+            let now = Utc::now().timestamp() as u32;
+            if let Some(transport) = &self.ctx.xdp_transport {
+                // 同步墙上时间给内核
+                let _ = transport.set_config_map(2, now);
+                // 触发用户态 Token 清理
+                self.ctx.plugins.token_manager.housekeeping();
+            }
+        }
+        
         let mut remove_list = Vec::new();
         let mut tasks = Vec::new();
         let timeout = self.ctx.config.session_timeout;

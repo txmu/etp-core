@@ -13,6 +13,7 @@ use rand::{Rng, thread_rng};
 use anyhow::{Result, Context};
 
 use crate::NodeID;
+use crate::common::NodeInfo; // 使用统一结构
 
 // ============================================================================
 //  常量配置
@@ -42,34 +43,6 @@ pub mod node_features {
     pub const SERVICE_HOST: u32 = 1 << 0;  // 提供服务
     pub const PUBLIC_IP:    u32 = 1 << 1;  // 拥有公网 IP
     pub const DHT_STORE:    u32 = 1 << 2;  // 允许存储数据
-}
-
-/// 增强型节点信息
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct NodeInfo {
-    pub id: NodeID,
-    pub addr: SocketAddr,
-    
-    /// 网络延迟 (RTT)
-    pub latency_ms: u16,
-    
-    /// 虚拟 IP (240.x.x.x)，用于 Overlay 路由
-    pub virtual_ip: Option<Ipv4Addr>,
-    
-    /// 最后活跃时间 (Unix Timestamp)
-    pub last_seen: u64,
-    
-    /// 首次发现时间
-    pub first_seen: u64,
-
-    /// 节点信誉分
-    pub reputation: i32,
-
-    /// 客户端版本字符串 (例如 "ETP/1.3.2")
-    pub client_version: String,
-
-    /// 能力位
-    pub features: u32,
 }
 
 impl NodeInfo {
@@ -202,7 +175,7 @@ impl KBucket {
     }
 
     /// 核心更新逻辑
-    fn update(&mut self, mut node: NodeInfo) -> DhtAddResult {
+    fn update(&mut self, mut incoming_node: NodeInfo) -> DhtAddResult {
         // 1. 检查黑名单
         if node.is_banned() {
             return DhtAddResult::RejectedBanned;
@@ -212,19 +185,25 @@ impl KBucket {
         node.touch();
 
         // 2. 如果节点已存在，移至队尾并更新信息
-        if let Some(idx) = self.nodes.iter().position(|n| n.id == node.id) {
+        if let Some(idx) = self.nodes.iter().position(|n| n.id == incoming_node.id) {
+            // 找到本地已有的节点记录
             let mut existing = self.nodes.remove(idx).unwrap();
-            // 融合信息：保留原有的信誉分和首次发现时间
-            existing.addr = node.addr;
-            existing.touch();
-            existing.latency_ms = node.latency_ms;
-            existing.client_version = node.client_version;
-            existing.features = node.features;
             
-            // 如果新传入的 node 携带了有效的 reputation 变更（例如来自上层逻辑），则累加
-            // 但通常 update 传入的是 discovery 发现的 node，reputation 为初始值。
-            // 这里我们保持 existing 的 reputation
+            // --- 核心合并逻辑：保护本地主权字段 ---
             
+            // 2.1. 更新网络参数 (信任对端声明的信息)
+            existing.addr = incoming_node.addr;
+            existing.latency_ms = incoming_node.latency_ms;
+            existing.virtual_ip = incoming_node.virtual_ip;
+            existing.client_version = incoming_node.client_version;
+            existing.features = incoming_node.features;
+            
+            // 2.2. 保护本地参数 (绝对不信任对端在报文中声明的这些字段，因为它们已被 serde(skip))
+            // 实际上 incoming_node 里的这些字段现在是默认值
+            // 我们保留 existing 里的旧值并更新活跃时间
+            existing.touch(); 
+            
+            // 2.3. 重新插入队列（LRU 策略：移至末尾）
             self.nodes.push_back(existing);
             return DhtAddResult::Updated;
         }

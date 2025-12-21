@@ -34,6 +34,11 @@ pub mod evolution_nexus;
 #[cfg(feature = "extensions")]
 pub mod signal_drop;
 
+/// [特性控制]：多网融合枢纽
+#[cfg(feature = "fusion-nexus")]
+pub mod fusion_nexus;
+
+
 // ============================================================================
 //  统一重新导出关键结构 (方便外部使用)
 // ============================================================================
@@ -46,3 +51,6 @@ pub use dsl_executor::DslExecutorFlavor;
 
 #[cfg(feature = "persistence")]
 pub use tns::TnsFlavor;
+
+#[cfg(feature = "fusion-nexus")]
+pub use fusion_nexus::{FusionNexusFlavor, NexusControlCmd};

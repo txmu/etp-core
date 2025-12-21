@@ -1,101 +1,276 @@
 // etp-core/src/wire/packet.rs
 
+//! # ETP 核心报文与令牌管理系统 (完全体)
+//! 
+//! 本模块负责 ETP 协议最底层的数据生命周期管理，涵盖了：
+//! 1. **高性能缓冲池**：利用线程局部存储 (TLS) 消除万兆网络下的锁竞争。
+//! 2. **零拷贝封装**：通过 `Bytes` 引用计数和预分配缓冲区实现极速封包。
+//! 3. **多态报文结构**：支持有状态会话包与无状态控制包。
+//! 4. **硬件级安全隔离**：与 XDP 驱动联动，在网卡层面执行秒级令牌拦截。
+//! 5. **内存粉碎**：在 `paranoid-security` 特性下强制执行内存物理擦除。
+
 use std::cell::RefCell;
-use std::fmt::Debug;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use serde::{Serialize, Deserialize};
-use rand::Rng;
+use bincode::{Options, DefaultOptions};
+use rand::{Rng, thread_rng};
 use anyhow::{Result, anyhow, Context};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use chrono::Utc;
-use bytes::Bytes;
+use parking_lot::Mutex;
+use log::{info, warn, error, debug, trace};
+use bytes::{Bytes, BytesMut};
 
-// 引入核心类型
+// 核心类型引用
 use crate::{PacketNumber, SessionID};
 use crate::wire::frame::Frame;
 use crate::crypto::noise::NoiseSession;
 use crate::plugin::Dialect;
-
-// [Security] 引入集束修改后的安全反序列化函数
 use crate::common::safe_deserialize;
 
-// [Security] 引入物理内存擦除特性
+// 安全增强：物理内存擦除
 #[cfg(feature = "paranoid-security")]
 use zeroize::Zeroize;
 
-// HMAC 类型别名
-type HmacSha256 = Hmac<Sha256>;
+// 硬件加速：XDP 驱动接口
+#[cfg(feature = "xdp")]
+use crate::network::xda_transport::XdpTransport;
 
 // ============================================================================
-//  1. 高性能线程局部内存池 (Thread-Local Buffer Pool)
-//  替代了原先的 Global Mutex，消除了多核竞争，极大提升 10Gbps+ 吞吐性能
+//  1. 线程局部缓冲区池 (Lock-Free Buffer Pool)
 // ============================================================================
 
-const POOL_PACKET_SIZE: usize = 2048; // 默认缓冲区大小 (略大于标准 MTU)
-const POOL_CAPACITY: usize = 1000;    // 每个线程缓存的 Buffer 数量上限
+/// 默认包大小：略大于标准 MTU 以容纳隧道开销
+const POOL_PACKET_SIZE: usize = 2048;
+/// 每个线程缓存的缓冲区上限，防止长尾内存占用
+const POOL_CAPACITY: usize = 1024;
 
+/// 内部缓冲区容器
 struct BufferPool {
     pool: Vec<Vec<u8>>,
-    // 可选：统计指标，用于性能调优
-    #[cfg(debug_assertions)]
-    hits: usize,
+    /// 性能指标：采集命中率
+    stats_hits: u64,
+    stats_misses: u64,
 }
 
 impl BufferPool {
     fn new() -> Self {
-        Self { 
+        Self {
             pool: Vec::with_capacity(POOL_CAPACITY),
-            #[cfg(debug_assertions)]
-            hits: 0,
+            stats_hits: 0,
+            stats_misses: 0,
         }
     }
 
+    /// 获取一个干净的缓冲区
+    #[inline]
     fn acquire(&mut self) -> Vec<u8> {
         if let Some(mut buf) = self.pool.pop() {
-            #[cfg(debug_assertions)] { self.hits += 1; }
-            buf.clear(); // 逻辑清空，保留 Capacity
+            self.stats_hits += 1;
+            buf.clear(); // 保持容量，逻辑清空
             buf
         } else {
+            self.stats_misses += 1;
             Vec::with_capacity(POOL_PACKET_SIZE)
         }
     }
-    
+
+    /// 归还缓冲区，执行必要的安全清理
+    #[inline]
     fn release(&mut self, mut buf: Vec<u8>) {
-        // [Security] 偏执模式：归还前强制擦除内存，防止残留密钥或明文
+        // [Security] 偏执模式：在缓冲区回到池中前，物理粉碎内存数据
+        // 防止后续其它逻辑获取到该缓冲区时读到旧的敏感明文或密钥残余
         #[cfg(feature = "paranoid-security")]
         {
             buf.as_mut_slice().zeroize();
         }
 
-        // 只有当 Buffer 容量合适且池未满时才回收，否则 Drop 释放内存
         if self.pool.len() < POOL_CAPACITY && buf.capacity() >= POOL_PACKET_SIZE {
             self.pool.push(buf);
         }
     }
 }
 
-// 使用 thread_local! 宏替代 lazy_static
+// 线程局部单例，确保高并发下无锁竞争
 thread_local! {
     static PACKET_POOL: RefCell<BufferPool> = RefCell::new(BufferPool::new());
 }
 
-/// 从当前线程的内存池获取缓冲区
+/// 从当前线程池分配一个缓冲区
 pub fn acquire_buffer() -> Vec<u8> {
-    PACKET_POOL.with(|pool| pool.borrow_mut().acquire())
+    PACKET_POOL.with(|p| p.borrow_mut().acquire())
 }
 
-/// 将缓冲区归还给当前线程的内存池
+/// 将缓冲区归还给当前线程池
 pub fn release_buffer(buf: Vec<u8>) {
-    PACKET_POOL.with(|pool| pool.borrow_mut().release(buf));
+    PACKET_POOL.with(|p| p.borrow_mut().release(buf));
 }
 
 // ============================================================================
-//  2. 数据包逻辑结构 (Logical Structures)
+//  2. 令牌管理器 (TokenManager) - 内置 XDP 硬件卸载
 // ============================================================================
 
-/// 有状态数据包 (会话内)
+/// 内部使用的令牌数据结构
+#[derive(Serialize, Deserialize)]
+struct TokenMetadata {
+    timestamp: i64,
+    salt: u64,
+}
+
+/// 令牌管理器实现
+pub struct TokenManager {
+    /// 令牌签名密钥 (Stateless Secret)
+    secret_key: [u8; 32],
+    
+    /// [手段 12] 追踪当前通过 XDP 卸载到硬件的 Token
+    /// 用于用户态 housekeeping 与内核态 Map 的同步删除
+    active_tokens: Mutex<HashMap<[u8; 32], u64>>,
+    
+    /// XDP 传输层句柄引用
+    #[cfg(feature = "xdp")]
+    xdp_link: Mutex<Option<Arc<XdpTransport>>>,
+
+    // 统计指标
+    pub stats_generated: AtomicU64,
+    pub stats_validated: AtomicU64,
+    pub stats_rejected: AtomicU64,
+}
+
+impl TokenManager {
+    pub fn new(secret: [u8; 32]) -> Self {
+        Self {
+            secret_key: secret,
+            active_tokens: Mutex::new(HashMap::new()),
+            #[cfg(feature = "xdp")]
+            xdp_link: Mutex::new(None),
+            stats_generated: AtomicU64::new(0),
+            stats_validated: AtomicU64::new(0),
+            stats_rejected: AtomicU64::new(0),
+        }
+    }
+
+    /// 关联 XDP 硬件平面
+    #[cfg(feature = "xdp")]
+    pub fn link_xdp_transport(&self, transport: Arc<XdpTransport>) {
+        let mut guard = self.xdp_link.lock();
+        *guard = Some(transport);
+        info!("TokenManager: Hardware XDP synchronization active.");
+    }
+
+    /// [手段 12/21] 核心：生成令牌并同步至网卡驱动
+    /// 
+    /// 格式: [Timestamp (8B)][Salt (8B)][HMAC-SHA256 (32B)] = 48 字节
+    pub fn generate_token(&self) -> Vec<u8> {
+        let now = Utc::now().timestamp();
+        let salt: u64 = thread_rng().gen();
+        
+        let mut meta_bytes = Vec::with_capacity(16);
+        meta_bytes.extend_from_slice(&now.to_be_bytes());
+        meta_bytes.extend_from_slice(&salt.to_be_bytes());
+
+        // 计算高强度签名
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret_key)
+            .expect("HMAC-SHA256 initialization failed");
+        mac.update(&meta_bytes);
+        let signature = mac.finalize().into_bytes();
+
+        let mut full_token = meta_bytes;
+        full_token.extend_from_slice(&signature);
+
+        // 构造硬件查找 Key (通常取签名部分的 32 字节摘要)
+        let mut xdp_key = [0u8; 32];
+        xdp_key.copy_from_slice(&full_token[16..48]);
+        
+        // 默认有效期 30 秒 (ETP 握手典型重试窗口)
+        let expiry = (now + 30) as u64;
+
+        // 更新用户态追踪表
+        self.active_tokens.lock().insert(xdp_key, expiry);
+
+        // 同步至内核态 eBPF Map
+        #[cfg(feature = "xdp")]
+        {
+            if let Some(transport) = &*self.xdp_link.lock() {
+                if let Err(e) = transport.sync_token(xdp_key, expiry) {
+                    trace!("TokenManager: XDP Map sync deferred (errno: {})", e);
+                }
+            }
+        }
+
+        self.stats_generated.fetch_add(1, Ordering::Relaxed);
+        full_token
+    }
+
+    /// 校验令牌合法性
+    pub fn validate_token(&self, token: &[u8]) -> bool {
+        if token.len() != 48 { return false; }
+
+        let (meta, sig) = token.split_at(16);
+        
+        // 1. 验证签名完整性
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret_key).unwrap();
+        mac.update(meta);
+        if mac.verify_slice(sig).is_err() {
+            self.stats_rejected.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+
+        // 2. 验证时间戳偏移 (允许 30 秒时钟抖动)
+        let ts = i64::from_be_bytes(meta[0..8].try_into().unwrap());
+        let delta = (Utc::now().timestamp() - ts).abs();
+        
+        if delta > 30 {
+            self.stats_rejected.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+
+        self.stats_validated.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// [内核维护逻辑]：清理过期令牌并释放网卡硬件资源
+    /// 由 EtpEngine 的 handle_tick 每秒触发一次
+    pub fn housekeeping(&self) {
+        let now = Utc::now().timestamp() as u64;
+        let mut to_flush = Vec::new();
+
+        {
+            let mut active = self.active_tokens.lock();
+            // 采用高效的 retain 进行就地删除
+            active.retain(|key, expiry| {
+                if now > *expiry {
+                    to_flush.push(*key);
+                    false // 移除过期项
+                } else {
+                    true // 保留
+                }
+            });
+        }
+
+        // 同步通知网卡驱动：这些令牌已失效，不再允许入站
+        #[cfg(feature = "xdp")]
+        {
+            if !to_flush.is_empty() {
+                if let Some(transport) = &*self.xdp_link.lock() {
+                    for key in to_flush {
+                        let _ = transport.remove_token(key);
+                    }
+                    debug!("TokenManager: Hardware plane cleanup finished ({} items flushed).", to_flush.len());
+                }
+            }
+        }
+    }
+}
+
+// ============================================================================
+//  3. 逻辑报文定义 (Logical Structures)
+// ============================================================================
+
+/// 有状态数据包：用于已建立 Noise 会话后的正常通信
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct StatefulPacket {
     pub session_id: SessionID,
@@ -103,259 +278,210 @@ pub struct StatefulPacket {
     pub frames: Vec<Frame>,
 }
 
-/// 无状态数据包 (握手/OOB)
+/// 无状态数据包：用于握手请求、NAT 探测、DHT 维护 (手段 12/15)
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct StatelessPacket {
-    pub token: Vec<u8>, 
+    /// 包含防重放与 HMAC 签名的令牌
+    pub token: Vec<u8>,
+    /// 用于一次性加密的随机数
     pub nonce: u64,
     pub frames: Vec<Frame>,
 }
 
-/// 解密后的包枚举
+/// 解密后的统一分发枚举
 #[derive(Debug)]
 pub enum DecryptedPacket {
     Stateful(StatefulPacket),
     Stateless(StatelessPacket),
 }
 
-impl DecryptedPacket {
-    /// 辅助构造函数：创建新的有状态包
-    pub fn new(session_id: SessionID, pn: PacketNumber) -> Self {
-        Self::Stateful(StatefulPacket {
-            session_id,
-            packet_number: pn,
-            frames: Vec::new(),
-        })
-    }
-
-    /// 获取内部帧列表的引用
-    pub fn frames(&self) -> &Vec<Frame> {
-        match self {
-            DecryptedPacket::Stateful(p) => &p.frames,
-            DecryptedPacket::Stateless(p) => &p.frames,
-        }
-    }
-
-    /// 向包中添加帧 (仅用于测试或构造)
-    pub fn add_frame(&mut self, frame: Frame) {
-        match self {
-            DecryptedPacket::Stateful(p) => p.frames.push(frame),
-            DecryptedPacket::Stateless(p) => p.frames.push(frame),
-        }
-    }
-
-    /// 序列化为字节 (仅用于测试)
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        match self {
-            DecryptedPacket::Stateful(p) => Ok(bincode::serialize(p)?),
-            DecryptedPacket::Stateless(p) => Ok(bincode::serialize(p)?),
-        }
-    }
-
-    /// 从字节反序列化 (仅用于测试，生产环境走 RawPacket)
-    pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if let Ok(p) = safe_deserialize::<StatefulPacket>(data) {
-            return Ok(Self::Stateful(p));
-        }
-        if let Ok(p) = safe_deserialize::<StatelessPacket>(data) {
-            return Ok(Self::Stateless(p));
-        }
-        Err(anyhow!("Unknown packet format"))
-    }
-}
-
 // ============================================================================
-//  3. 令牌管理 (Token Management)
+//  4. 物理层封装 (RawPacket - Zero Copy optimized)
 // ============================================================================
 
-#[derive(Serialize, Deserialize)]
-struct TokenData {
-    timestamp: i64,
-    random_salt: u64,
-}
-
-/// 负责生成和验证无状态令牌 (防重放/DoS)
-pub struct TokenManager {
-    secret_key: [u8; 32],
-}
-
-impl TokenManager {
-    pub fn new(secret_key: [u8; 32]) -> Self {
-        Self { secret_key }
-    }
-
-    pub fn generate_token(&self) -> Vec<u8> {
-        let data = TokenData {
-            timestamp: Utc::now().timestamp(),
-            random_salt: rand::random(),
-        };
-        // 这里可以使用标准 serialize，因为是我们自己生成的数据，可信
-        let bytes = bincode::serialize(&data).unwrap(); 
-        
-        let mut mac = HmacSha256::new_from_slice(&self.secret_key).expect("HMAC init failed");
-        mac.update(&bytes);
-        let result = mac.finalize();
-        
-        // Token = Data + HMAC
-        let mut token = bytes;
-        token.extend_from_slice(&result.into_bytes());
-        token
-    }
-
-    pub fn validate_token(&self, token: &[u8]) -> bool {
-        // 最小长度检查 (HMAC-SHA256 是 32 字节)
-        if token.len() < 32 { return false; } 
-        
-        let split_idx = token.len() - 32; 
-        let (data_bytes, sig_bytes) = token.split_at(split_idx);
-        
-        // 1. 验证签名
-        let mut mac = HmacSha256::new_from_slice(&self.secret_key).unwrap();
-        mac.update(data_bytes);
-        if mac.verify_slice(sig_bytes).is_err() { 
-            return false; 
-        }
-        
-        // 2. 验证数据内容与时间戳
-        // [Security] 使用安全反序列化，防止 Token 本身包含恶意构造的巨大对象
-        if let Ok(data) = safe_deserialize::<TokenData>(data_bytes) {
-            let now = Utc::now().timestamp();
-            // 允许 30 秒的时间误差 (防重放窗口)
-            if (now - data.timestamp).abs() > 30 { 
-                return false; 
-            }
-            return true;
-        }
-        
-        false
-    }
-}
-
-// ============================================================================
-//  4. 物理包封装 (RawPacket - Zero Copy Optimized)
-// ============================================================================
-
-/// 封装了物理层传输的字节数据
-/// 拥有底层 Buffer 的所有权，并在 Drop 时自动归还给 Pool
+/// 封装了加密并经过方言混淆的物理数据包
 pub struct RawPacket {
-    /// 对外暴露的数据切片 (Bytes 提供了引用计数和切片能力)
-    pub data: Bytes, 
-    /// 内部持有的原始 Buffer，用于 Drop 时归还
-    /// Option 用于在 Drop 时 take() 所有权
-    pub _backing_buffer: Option<Vec<u8>>,
+    /// 引用计数的不可变字节流，支持零拷贝切片
+    pub data: Bytes,
+    /// 原始缓冲区，用于在 Drop 时将所有权归还给线程池
+    _backing_buffer: Option<Vec<u8>>,
 }
 
 impl RawPacket {
-    /// 零拷贝加密并封装
+    /// 封装逻辑：Logical -> Serialize -> Pad -> Encrypt -> Dialect -> Raw
     /// 
-    /// 流程: Logical Packet -> Serialize -> Padding -> Encrypt -> Obfuscate -> RawPacket
+    /// # Arguments
+    /// * `packet` - 待发送的逻辑包
+    /// * `crypto` - Noise 会话实例
+    /// * `target_size` - 目标填充大小 (用于破坏长度特征)
+    /// * `dialect` - 使用的协议方言
     pub fn encrypt_and_seal(
         packet: &DecryptedPacket,
         crypto: &mut NoiseSession,
         target_size: Option<usize>,
-        dialect: &dyn Dialect
+        dialect: &dyn Dialect,
     ) -> Result<Self> {
         
-        // 1. 获取缓冲区 (从 Thread-Local Pool)
+        // 1. 分配缓冲区 (TLS Pool)
         let mut buffer = acquire_buffer();
         
-        // 2. 序列化 (Bincode 写入 Buffer)
-        // 使用 serialize_into 直接写入 vec，避免额外内存分配
+        // 2. 执行序列化 (零分配写入)
         match packet {
             DecryptedPacket::Stateful(p) => bincode::serialize_into(&mut buffer, p)
-                .context("Packet serialization failed")?,
+                .context("Stateful serialization error")?,
             DecryptedPacket::Stateless(p) => bincode::serialize_into(&mut buffer, p)
-                .context("Packet serialization failed")?,
-        };
+                .context("Stateless serialization error")?,
+        }
 
-        // 3. 填充 (Padding)
-        // 如果指定了目标大小，且当前数据小于目标大小，则填充随机数据
-        // 注意：Noise 协议会把这部分作为明文一起加密，因此对端解密后需要能识别截止位
-        // 或者依赖 Bincode 的自描述性忽略尾部数据 (safe_deserialize 已开启 allow_trailing_bytes)
+        // 3. 应用流量整形填充 (Padding)
+        // 即使没有应用层数据，也会在此处补齐垃圾数据
         if let Some(size) = target_size {
             if buffer.len() < size {
-                let padding_len = size - buffer.len();
                 let current_len = buffer.len();
-                // 扩容并填充垃圾数据
-                buffer.resize(current_len + padding_len, 0);
-                rand::thread_rng().fill(&mut buffer[current_len..]);
+                buffer.resize(size, 0);
+                thread_rng().fill(&mut buffer[current_len..]);
             }
         }
 
-        // 4. 加密 (Encrypt)
-        // 使用第二个 buffer 作为密文容器 (Noise 协议通常需要 OutBuffer)
+        // 4. 执行 Noise 加密 (AEAD)
         let mut cipher_buffer = acquire_buffer();
-        // 预估容量：明文 + MAC (16) + Dialect Header (e.g. 100)
-        cipher_buffer.resize(buffer.len() + 16 + 128, 0); 
+        // 预留 MAC 标签空间 (通常 16-32 字节)
+        cipher_buffer.resize(buffer.len() + 32, 0);
         
-        let len = crypto.encrypt(&buffer, &mut cipher_buffer)
-            .context("Noise encryption failed")?;
-        cipher_buffer.truncate(len);
+        let encrypted_len = crypto.encrypt(&buffer, &mut cipher_buffer)
+            .map_err(|e| anyhow!("Noise crypto error: {}", e))?;
+        cipher_buffer.truncate(encrypted_len);
         
-        // 明文处理完毕，立即归还明文 buffer (触发 Zeroize)
+        // 明文数据已加密，立即释放原始 buffer (触发安全擦除)
         release_buffer(buffer);
 
-        // 5. 方言伪装 (Dialect Obfuscation)
-        // In-place 修改密文 buffer，添加头部或进行混淆
+        // 5. 应用方言伪装 (Dialect Obfuscation)
+        // 这是一个 In-Place 操作，可能添加 HTTP 头部或 TLS 记录伪装
         dialect.seal(&mut cipher_buffer);
 
-        Ok(RawPacket {
-            data: Bytes::from(cipher_buffer.clone()), 
+        Ok(Self {
+            data: Bytes::from(cipher_buffer.clone()),
             _backing_buffer: Some(cipher_buffer),
         })
     }
 
-    /// 解封并解密
-    /// 
-    /// 流程: Raw Data -> De-obfuscate -> Decrypt -> Deserialize (Safe) -> Logical Packet
+    /// 解封逻辑：Raw Data -> Dialect Open -> Decrypt -> Deserialize
     pub fn unseal_and_decrypt(
         raw_data: &[u8],
         crypto: &mut NoiseSession,
-        dialect: &dyn Dialect
+        dialect: &dyn Dialect,
     ) -> Result<DecryptedPacket> {
-        // 1. 去伪装 (De-obfuscate)
-        // 注意：open 可能会返回一个新的 Vec，或者 Cow。Dialect trait 目前定义为返回 Result<Vec<u8>>
+        
+        // 1. 方言剥离 (De-obfuscate)
         let encrypted_payload = dialect.open(raw_data)
-            .context("Dialect open failed")?;
+            .context("Dialect de-obfuscation failed")?;
 
-        // 2. 解密 (Decrypt)
-        // 使用 Pool 获取解密缓冲区
-        let mut plaintext_buf = acquire_buffer();
-        // 确保缓冲区足够大
-        plaintext_buf.resize(encrypted_payload.len(), 0);
+        // 2. 解密
+        let mut plain_buf = acquire_buffer();
+        plain_buf.resize(encrypted_payload.len(), 0);
         
-        let len = crypto.decrypt(&encrypted_payload, &mut plaintext_buf)
-            .context("Noise decryption failed")?;
-        plaintext_buf.truncate(len);
+        let decrypted_len = crypto.decrypt(&encrypted_payload, &mut plain_buf)
+            .map_err(|_| anyhow!("Noise integrity check failed (Bad Key or Tampered)"))?;
+        plain_buf.truncate(decrypted_len);
 
-        // 3. 安全反序列化 (Safe Deserialize)
-        // 尝试解析为 Stateful (大部分流量)
-        if let Ok(p) = safe_deserialize::<StatefulPacket>(&plaintext_buf) {
-             // 简单的完整性检查
-             if p.session_id != 0 {
-                 // 成功，归还缓冲区
-                 release_buffer(plaintext_buf);
-                 return Ok(DecryptedPacket::Stateful(p));
-             }
-        } 
-        
-        // 尝试解析为 Stateless (握手包/OOB)
-        if let Ok(p) = safe_deserialize::<StatelessPacket>(&plaintext_buf) {
-             release_buffer(plaintext_buf);
-             return Ok(DecryptedPacket::Stateless(p));
+        // 3. 安全反序列化判定
+        // 首先尝试解析大多数情况下的 Stateful 包 (session_id != 0)
+        let bincode_config = DefaultOptions::new()
+            .with_limit(10 * 1024 * 1024) // 10MB 防御性上限
+            .allow_trailing_bytes();
+
+        if let Ok(stateful) = bincode_config.deserialize::<StatefulPacket>(&plain_buf) {
+            if stateful.session_id != 0 {
+                release_buffer(plain_buf);
+                return Ok(DecryptedPacket::Stateful(stateful));
+            }
         }
-        
-        // 失败，归还缓冲区并报错
-        release_buffer(plaintext_buf);
-        Err(anyhow!("Packet decode failed: Invalid format or integrity check error"))
+
+        // 尝试解析无状态包 (如握手)
+        if let Ok(stateless) = bincode_config.deserialize::<StatelessPacket>(&plain_buf) {
+            release_buffer(plain_buf);
+            return Ok(DecryptedPacket::Stateless(stateless));
+        }
+
+        // 兜底释放并报错
+        release_buffer(plain_buf);
+        Err(anyhow!("Packet protocol mismatch: unrecognizable structure"))
     }
 }
 
-/// 自动资源回收
+/// 自动资源回收：当 RawPacket 离开作用域时，缓冲区自动回池
 impl Drop for RawPacket {
     fn drop(&mut self) {
         if let Some(buf) = self._backing_buffer.take() {
             release_buffer(buf);
+        }
+    }
+}
+
+// ============================================================================
+//  5. 单元测试 (完整不省略)
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::noise::KeyPair;
+
+    #[test]
+    fn test_thread_local_pool_efficiency() {
+        // 连续 acquire 并 release
+        let mut bufs = Vec::new();
+        for _ in 0..10 {
+            bufs.push(acquire_buffer());
+        }
+        for b in bufs {
+            release_buffer(b);
+        }
+        
+        // 再次获取应命中池
+        let b = acquire_buffer();
+        assert!(b.capacity() >= POOL_PACKET_SIZE);
+        release_buffer(b);
+    }
+
+    #[test]
+    fn test_token_lifecycle() {
+        let secret = [0x42u8; 32];
+        let manager = TokenManager::new(secret);
+        
+        let token = manager.generate_token();
+        assert!(manager.validate_token(&token));
+        
+        // 篡改 Token
+        let mut bad_token = token.clone();
+        bad_token[40] ^= 0xFF;
+        assert!(!manager.validate_token(&bad_token));
+    }
+
+    #[test]
+    fn test_packet_full_cycle() {
+        // 模拟 Noise 环境
+        let keys = KeyPair::generate();
+        let mut session = NoiseSession::new_initiator(&keys, &keys.public).unwrap();
+        let dialect = crate::plugin::StandardDialect;
+
+        let original = DecryptedPacket::Stateful(StatefulPacket {
+            session_id: 12345,
+            packet_number: 1,
+            frames: vec![Frame::new_padding(100)],
+        });
+
+        // 加密封包
+        let raw = RawPacket::encrypt_and_seal(&original, &mut session, Some(512), &dialect).unwrap();
+        
+        // 解密还原
+        let restored = RawPacket::unseal_and_decrypt(&raw.data, &mut session, &dialect).unwrap();
+        
+        if let DecryptedPacket::Stateful(p) = restored {
+            assert_eq!(p.session_id, 12345);
+            assert_eq!(p.packet_number, 1);
+        } else {
+            panic!("Restored packet type mismatch");
         }
     }
 }

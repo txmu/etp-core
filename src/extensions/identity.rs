@@ -18,6 +18,8 @@ use blake3;
 
 use crate::NodeID;
 
+use tokio_util::sync::CancellationToken;
+
 // ============================================================================
 //  1. 基础定义
 // ============================================================================
@@ -310,34 +312,69 @@ pub struct CitizenIdentity {
 }
 
 impl CitizenIdentity {
-    pub fn new(difficulty: u8) -> Self {
-        // 挖矿逻辑 (简化)
-        let key = SigningKey::generate(&mut rand::thread_rng());
-        let pub_bytes = key.verifying_key().as_bytes();
-        let mut nonce = 0u64;
+    /// 生产级异步工厂：生成带有 PoW 证明的公民身份
+    /// 
+    /// # Arguments
+    /// * `difficulty` - 目标哈希前导零位难度
+    /// * `cancel_token` - 可选的取消令牌。若提供，可在外部随时停止计算
+    pub async fn create_async(
+        difficulty: u8, 
+        cancel_token: Option<CancellationToken>
+    ) -> Result<Self> {
+        info!("Citizen: Initiating PoW (Difficulty: {}). Resources allocated.", difficulty);
         
-        loop {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(pub_bytes);
-            hasher.update(&nonce.to_be_bytes());
-            let hash = hasher.finalize();
-            if Self::check_difficulty(hash.as_bytes(), difficulty) {
+        let signing_key = SigningKey::generate(&mut rand::thread_rng());
+        let pub_bytes = signing_key.verifying_key().to_bytes();
+        let key_bytes = signing_key.to_bytes();
+
+        // 将任务卸载至 spawn_blocking 以保护 Reactor 线程
+        let nonce = tokio::task::spawn_blocking(move || {
+            let mut current_nonce = 0u64;
+            loop {
+                // 每 16384 次迭代检查一次取消状态，平衡计算效率与响应灵敏度
+                if current_nonce & 0x3FFF == 0 {
+                    if let Some(ref token) = cancel_token {
+                        if token.is_cancelled() {
+                            return Err(anyhow!("Citizen PoW interrupted by cancellation token"));
+                        }
+                    }
+                }
+
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&pub_bytes);
+                hasher.update(&current_nonce.to_be_bytes());
+                let hash = hasher.finalize();
+
+                if Self::check_difficulty(hash.as_bytes(), difficulty) {
+                    return Ok(current_nonce);
+                }
+
+                // 移除 1_000_000 安全阀，由外部 cancel_token 接管生命周期控制
+                current_nonce = current_nonce.wrapping_add(1);
+            }
+        }).await.context("Citizen PoW task panic")??;
+
+        debug!("Citizen: PoW successful. Nonce found: {}", nonce);
+
+        Ok(Self {
+            key: SigningKey::from_bytes(&key_bytes),
+            nonce,
+            difficulty,
+        })
+    }
+
+    /// 核心判定逻辑：统计 BLAKE3 结果的前导零
+    fn check_difficulty(hash: &[u8], target_difficulty: u8) -> bool {
+        let mut actual_zeros = 0;
+        for &byte in hash {
+            if byte == 0 {
+                actual_zeros += 8;
+            } else {
+                actual_zeros += byte.leading_zeros() as usize;
                 break;
             }
-            nonce += 1;
-            if nonce > 1_000_000 { break; } // Timeout for demo
         }
-        
-        Self { key, nonce, difficulty }
-    }
-    
-    fn check_difficulty(hash: &[u8], diff: u8) -> bool {
-        let mut zeros = 0;
-        for &b in hash {
-            if b == 0 { zeros += 8; }
-            else { zeros += b.leading_zeros() as usize; break; }
-        }
-        zeros >= diff as usize
+        actual_zeros >= target_difficulty as usize
     }
 }
 

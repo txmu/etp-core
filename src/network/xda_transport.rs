@@ -224,6 +224,25 @@ fn parse_mac_str(s: &str) -> Option<[u8; 6]> {
 
 #[cfg(feature = "xdp")]
 impl XdpTransport {
+    /// 同步 Token 到内核
+    pub fn sync_token(&self, token: [u8; 32], expiry: u64) -> Result<()> {
+        let mut token_map = aya::maps::HashMap::try_from(self._bpf.map_mut("ETP_ALLOWED_TOKENS").unwrap())?;
+        // 0 标志表示如果存在则更新
+        token_map.insert(token, expiry, 0).map_err(|e| anyhow!("BPF Map Insert Error: {}", e))
+    }
+    
+    /// [新增] 从内核移除过期 Token
+    pub fn remove_token(&self, token: [u8; 32]) -> Result<()> {
+        let mut token_map = aya::maps::HashMap::try_from(self._bpf.map_mut("ETP_ALLOWED_TOKENS").unwrap())?;
+        token_map.remove(&token).map_err(|e| anyhow!("BPF Map Delete Error: {}", e))
+    }
+    
+    /// 设置全局配置 (如时间戳同步)
+    pub fn set_config_map(&self, key: u32, value: u32) -> Result<()> {
+        let mut config_map = aya::maps::HashMap::try_from(self._bpf.map_mut("ETP_GLOBAL_CONFIG").unwrap())?;
+        config_map.insert(key, value, 0).map_err(|e| anyhow!("BPF Config Error: {}", e))
+    }
+    
     pub fn new(interface: &str, queue_id: u32, local_port: u16) -> anyhow::Result<Self> {
         info!("AF_XDP: Initializing on {} (Queue {}) Port {}", interface, queue_id, local_port);
 

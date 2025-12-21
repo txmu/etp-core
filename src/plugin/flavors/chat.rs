@@ -1,4 +1,3 @@
-
 // etp-core/src/plugin/flavors/chat.rs
 
 #![cfg(feature = "sled")]
