@@ -22,12 +22,12 @@ use crate::transport::padding::PaddingStrategy;
 /// 系统上下文接口：暴露给插件的安全系统能力
 /// 允许插件查询路由表或检查连接状态，而无需持有 Engine 的全量锁
 pub trait SystemContext: Send + Sync {
+    /// 核心变更：返回 NodeInfo，以便插件读取 reputation 字段执行安全策略
     /// 根据 NodeID 查找已知的物理地址 (DHT/Local Routing Table)
-    fn lookup_peer(&self, node_id: &NodeID) -> Option<SocketAddr>;
+    fn lookup_peer(&self, node_id: &NodeID) -> Option<crate::common::NodeInfo>;
     
     /// 检查与指定地址的会话是否处于活跃状态
     fn is_connected(&self, addr: SocketAddr) -> bool;
-    
     /// 获取当前节点的 ID
     fn my_node_id(&self) -> NodeID;
 }
